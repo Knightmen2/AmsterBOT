@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 
+DEFAULT_URL = "https://amsterbot.onrender.com"
 DEFAULT_INTERVAL = 300
 
 
@@ -40,7 +41,11 @@ def ping(url: str, timeout: float = 30.0) -> tuple[bool, str]:
 
 
 def main() -> int:
-    url = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("KEEP_ALIVE_URL", "")).strip()
+    url = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else os.getenv("KEEP_ALIVE_URL", DEFAULT_URL)
+    ).strip()
     if not url:
         print("Задайте URL: KEEP_ALIVE_URL или аргумент python keepalive.py https://....onrender.com")
         return 1

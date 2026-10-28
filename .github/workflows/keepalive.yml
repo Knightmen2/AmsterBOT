@@ -1,6 +1,5 @@
-# Пинг Render каждые 5 минут без включённого ПК.
-# В GitHub → Settings → Secrets and variables → Actions
-# добавьте секрет KEEP_ALIVE_URL = https://ВАШ-СЕРВИС.onrender.com
+# Пинг Render каждые 5 минут, чтобы Free-сервис не засыпал.
+# ПК можно выключать — работает через GitHub Actions.
 
 name: Keep Render Awake
 
@@ -15,14 +14,20 @@ jobs:
     steps:
       - name: Ping Render
         env:
+          # Секрет KEEP_ALIVE_URL опционален; иначе используется URL сервиса.
           KEEP_ALIVE_URL: ${{ secrets.KEEP_ALIVE_URL }}
         run: |
-          if [ -z "$KEEP_ALIVE_URL" ]; then
-            echo "Секрет KEEP_ALIVE_URL не задан"
-            exit 1
-          fi
-          URL="${KEEP_ALIVE_URL%/}/"
+          URL="${KEEP_ALIVE_URL:-https://amsterbot.onrender.com}"
+          URL="${URL%/}/"
           echo "GET $URL"
-          curl -fsS -A "bcwallfiles-keepalive/1.0" -o /tmp/keepalive.out -w "HTTP %{http_code}\n" "$URL"
-          head -c 64 /tmp/keepalive.out || true
-          echo
+          for i in 1 2 3 4 5; do
+            if curl -fsS -A "amsterbot-keepalive/1.0" --max-time 60 -o /tmp/keepalive.out -w "HTTP %{http_code}\n" "$URL"; then
+              head -c 64 /tmp/keepalive.out || true
+              echo
+              exit 0
+            fi
+            echo "Попытка $i не удалась, ждём (холодный старт)..."
+            sleep 15
+          done
+          echo "Не удалось достучаться до Render"
+          exit 1
