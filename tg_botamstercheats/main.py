@@ -7,7 +7,7 @@
 Render (Web Service):
     Build: pip install -r requirements.txt
     Start: python -u main.py
-    Env: BOT_TOKEN, ADMIN_IDS, MANDATORY_CHANNEL
+    Env: BOT_TOKEN, ADMIN_IDS, MANDATORY_CHANNELS
     Бесплатный тариф засыпает ~15 минут без HTTP — пингуйте URL или Background Worker.
 
 Бот должен быть администратором обязательного канала и каждого канала из админки,
@@ -43,14 +43,39 @@ from aiogram.types import (
     Message,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8885848241:AAEC_CBMNYpB-u-L_QYR-UXm89kRzW7ydks").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8573398640:AAELCe9o54NX2Tm0Dsewcxln2ytDhHpuA_I").strip()
 _DEFAULT_ADMINS = "7479229021,823427049"
 ADMIN_IDS = frozenset(
     int(part.strip())
     for part in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", _DEFAULT_ADMINS)).split(",")
     if part.strip().lstrip("-").isdigit()
 )
-MANDATORY_CHANNEL = os.getenv("MANDATORY_CHANNEL", "@dfgames2").strip()
+_DEFAULT_MANDATORY = "@amstercheats,@amstercloud"
+_REMOVED_CHANNELS = frozenset({"@dfgames2"})
+
+
+def _parse_channel_list(raw: str) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
+            continue
+        if not value.startswith("@") and not value.lstrip("-").isdigit():
+            value = f"@{value}"
+        key = value.lower()
+        if key in seen or key in _REMOVED_CHANNELS:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
+
+
+MANDATORY_CHANNELS = _parse_channel_list(
+    os.getenv("MANDATORY_CHANNELS", os.getenv("MANDATORY_CHANNEL", _DEFAULT_MANDATORY))
+)
+if not MANDATORY_CHANNELS:
+    MANDATORY_CHANNELS = _parse_channel_list(_DEFAULT_MANDATORY)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -60,6 +85,7 @@ HASH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 CHANNEL_ID_RE = re.compile(r"^-?\d{5,20}$")
 NO_LINK = LinkPreviewOptions(is_disabled=True)
+MANDATORY_LOOKUP = {item.lower() for item in MANDATORY_CHANNELS}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,18 +176,32 @@ async def init_db() -> None:
                 id INTEGER PRIMARY KEY,
                 file_id TEXT,
                 file_hash TEXT UNIQUE,
-                file_type TEXT
+                file_type TEXT,
+                caption TEXT
             )
             """
         )
+        await db.commit()
+        try:
+            await db.execute("ALTER TABLE files ADD COLUMN caption TEXT")
+            await db.commit()
+        except sqlite3.OperationalError:
+            pass
+        # Удаляем старые обязательные и дубликаты текущих обязательных из таблицы.
+        cursor = await db.execute("SELECT id, channel_id FROM channels")
+        rows = await cursor.fetchall()
+        for row in rows:
+            channel_id = (row["channel_id"] or "").strip().lower()
+            if channel_id in _REMOVED_CHANNELS or channel_id in MANDATORY_LOOKUP:
+                await db.execute("DELETE FROM channels WHERE id = ?", (row["id"],))
         await db.commit()
     finally:
         await db.close()
 
 
 async def required_channels() -> list[str]:
-    channels = [MANDATORY_CHANNEL]
-    seen = {MANDATORY_CHANNEL.lower()}
+    channels = list(MANDATORY_CHANNELS)
+    seen = set(MANDATORY_LOOKUP)
     db = await db_conn()
     try:
         cursor = await db.execute("SELECT channel_id FROM channels ORDER BY id")
@@ -170,8 +210,9 @@ async def required_channels() -> list[str]:
         await db.close()
     for row in rows:
         channel_id = (row["channel_id"] or "").strip()
-        if channel_id and channel_id.lower() not in seen:
-            seen.add(channel_id.lower())
+        key = channel_id.lower()
+        if channel_id and key not in seen and key not in _REMOVED_CHANNELS:
+            seen.add(key)
             channels.append(channel_id)
     return channels
 
@@ -215,7 +256,7 @@ async def delete_channel_by_ref(raw: str) -> tuple[bool, str]:
     channel = normalize_channel(raw)
     if channel is None:
         return False, "Отправьте юзернейм канала (с @) или числовой ID."
-    if channel.lower() == MANDATORY_CHANNEL.lower():
+    if channel.lower() in MANDATORY_LOOKUP:
         return False, "Обязательный канал удалить нельзя."
 
     db = await db_conn()
@@ -253,15 +294,32 @@ async def delete_channel_by_id(channel_pk: int) -> str | None:
         await db.close()
 
 
-async def save_file(file_id: str, file_type: str) -> str:
+async def save_content(
+    file_type: str,
+    *,
+    file_id: str | None = None,
+    caption: str | None = None,
+) -> str:
+    caption_value = (caption or "").strip() or None
+    file_value = (file_id or "").strip() or None
+    if file_type == "text":
+        if not caption_value:
+            raise ValueError("Пустой текст")
+        file_value = None
+    elif not file_value:
+        raise ValueError("Нет file_id")
+
     db = await db_conn()
     try:
         for _ in range(8):
             file_hash = secrets.token_urlsafe(6)
             try:
                 await db.execute(
-                    "INSERT INTO files (file_id, file_hash, file_type) VALUES (?, ?, ?)",
-                    (file_id, file_hash, file_type),
+                    """
+                    INSERT INTO files (file_id, file_hash, file_type, caption)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (file_value, file_hash, file_type, caption_value),
                 )
                 await db.commit()
                 return file_hash
@@ -276,7 +334,7 @@ async def get_file(file_hash: str) -> sqlite3.Row | None:
     db = await db_conn()
     try:
         cursor = await db.execute(
-            "SELECT file_id, file_type FROM files WHERE file_hash = ?",
+            "SELECT file_id, file_type, caption FROM files WHERE file_hash = ?",
             (file_hash,),
         )
         return await cursor.fetchone()
@@ -327,7 +385,8 @@ def gate_text(failed: list[str]) -> str:
 
 
 def channel_list_text(rows: list[sqlite3.Row]) -> str:
-    lines = [f"Обязательный канал: {MANDATORY_CHANNEL}"]
+    lines = ["Обязательные каналы:"]
+    lines.extend(f"• {channel}" for channel in MANDATORY_CHANNELS)
     if not rows:
         lines.append("Дополнительные каналы не добавлены.")
         return "\n".join(lines)
@@ -402,13 +461,58 @@ def extract_file(message: Message) -> tuple[str, str] | None:
     return None
 
 
-async def send_stored_file(bot: Bot, chat_id: int, file_id: str, file_type: str) -> None:
+def row_caption(row: sqlite3.Row) -> str | None:
+    try:
+        value = row["caption"]
+    except (KeyError, IndexError):
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+async def send_stored_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
+    file_type = (row["file_type"] or "document").strip()
+    caption = row_caption(row)
+    file_id = (row["file_id"] or "").strip()
+
+    if file_type == "text":
+        if not caption:
+            raise RuntimeError("Пустой текст в записи")
+        await bot.send_message(chat_id, caption)
+        return
+
+    if not file_id:
+        raise RuntimeError("Пустой file_id")
+
+    # Подпись у медиа в Telegram до 1024 символов; длинный текст шлём отдельно.
+    media_caption = caption if caption and len(caption) <= 1024 else None
+    overflow = caption if caption and len(caption) > 1024 else None
+
     if file_type == "photo":
-        await bot.send_photo(chat_id, file_id)
+        await bot.send_photo(chat_id, file_id, caption=media_caption)
     elif file_type == "video":
-        await bot.send_video(chat_id, file_id)
+        await bot.send_video(chat_id, file_id, caption=media_caption)
     else:
-        await bot.send_document(chat_id, file_id)
+        await bot.send_document(chat_id, file_id, caption=media_caption)
+
+    if overflow:
+        await bot.send_message(chat_id, overflow)
+    elif caption and media_caption is None:
+        await bot.send_message(chat_id, caption)
+
+
+async def reply_with_share_link(message: Message, bot: Bot, file_hash: str, kind: str) -> None:
+    username = await ensure_username(bot)
+    shown = f"t.me/{username}?start={file_hash}"
+    url = f"https://t.me/{username}?start={file_hash}"
+    label = "Ссылка на текст" if kind == "text" else "Ссылка на файл"
+    await message.answer(
+        f'{label}:\n<a href="{url}">{shown}</a>',
+        parse_mode=ParseMode.HTML,
+        link_preview_options=NO_LINK,
+    )
 
 
 async def ensure_username(bot: Bot) -> str:
@@ -431,7 +535,7 @@ async def notify(event: Message | CallbackQuery, text: str, **kwargs: object) ->
 async def deliver_or_gate(bot: Bot, chat_id: int, user_id: int, file_hash: str, row: sqlite3.Row) -> tuple[str, InlineKeyboardMarkup] | None:
     missing, failed = await check_subscriptions(bot, user_id)
     if not missing and not failed:
-        await send_stored_file(bot, chat_id, row["file_id"], row["file_type"] or "document")
+        await send_stored_content(bot, chat_id, row)
         return None
     keyboard = await build_subscribe_keyboard(bot, file_hash)
     return gate_text(failed), keyboard
@@ -450,11 +554,14 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
     if not payload:
         if message.from_user.id in ADMIN_IDS:
             await message.answer(
-                "Админ-панель.\nОтправьте документ, фото или видео — бот вернёт ссылку на файл.",
+                "Админ-панель.\n"
+                "• Файл (документ/фото/видео) — ссылка на файл\n"
+                "• Файл с подписью — файл + текст пользователю\n"
+                "• Просто текст — ссылка только на текст",
                 reply_markup=admin_keyboard(),
             )
             return
-        await message.answer("Перейдите по ссылке на файл, чтобы получить его.")
+        await message.answer("Перейдите по ссылке на файл или текст, чтобы получить его.")
         return
 
     if not HASH_RE.fullmatch(payload):
@@ -469,8 +576,8 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
     try:
         gate = await deliver_or_gate(bot, message.chat.id, message.from_user.id, payload, row)
     except Exception as exc:
-        logger.warning("Предупреждение: не удалось отправить файл %s (%s).", payload, exc)
-        await message.answer("Не удалось отправить файл. Попробуйте позже.")
+        logger.warning("Предупреждение: не удалось отправить контент %s (%s).", payload, exc)
+        await message.answer("Не удалось отправить. Попробуйте позже.")
         return
     if gate is not None:
         text, keyboard = gate
@@ -513,15 +620,10 @@ async def cb_check_sub(callback: CallbackQuery, bot: Bot) -> None:
         except TelegramBadRequest:
             pass
     try:
-        await send_stored_file(
-            bot,
-            callback.from_user.id,
-            row["file_id"],
-            row["file_type"] or "document",
-        )
+        await send_stored_content(bot, callback.from_user.id, row)
     except Exception as exc:
-        logger.warning("Предупреждение: не удалось отправить файл %s (%s).", file_hash, exc)
-        await bot.send_message(callback.from_user.id, "Не удалось отправить файл. Попробуйте позже.")
+        logger.warning("Предупреждение: не удалось отправить контент %s (%s).", file_hash, exc)
+        await bot.send_message(callback.from_user.id, "Не удалось отправить. Попробуйте позже.")
 
 
 @router.callback_query(F.data == "channel:nolink")
@@ -545,7 +647,10 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
 async def cmd_admin(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Админ-панель.\nОтправьте документ, фото или видео — бот вернёт ссылку на файл.",
+        "Админ-панель.\n"
+        "• Файл (документ/фото/видео) — ссылка на файл\n"
+        "• Файл с подписью — файл + текст пользователю\n"
+        "• Просто текст — ссылка только на текст",
         reply_markup=admin_keyboard(),
     )
 
@@ -625,22 +730,38 @@ async def admin_file(message: Message, bot: Bot) -> None:
     if extracted is None:
         return
     file_id, file_type = extracted
+    caption = (message.caption or "").strip() or None
     try:
-        file_hash = await save_file(file_id, file_type)
-        username = await ensure_username(bot)
+        file_hash = await save_content(file_type, file_id=file_id, caption=caption)
+        await reply_with_share_link(message, bot, file_hash, "file")
     except Exception as exc:
         logger.warning("Предупреждение: не удалось сохранить файл (%s).", exc)
         await message.answer("Не удалось создать ссылку. Отправьте файл ещё раз.")
         return
-
-    shown = f"t.me/{username}?start={file_hash}"
-    url = f"https://t.me/{username}?start={file_hash}"
-    logger.info("Файл сохранён: type=%s hash=%s", file_type, file_hash)
-    await message.answer(
-        f'Ссылка на файл:\n<a href="{url}">{shown}</a>',
-        parse_mode=ParseMode.HTML,
-        link_preview_options=NO_LINK,
+    logger.info(
+        "Файл сохранён: type=%s hash=%s caption=%s",
+        file_type,
+        file_hash,
+        bool(caption),
     )
+
+
+@admin_router.message(F.text, ~F.text.startswith("/"))
+async def admin_text(message: Message, bot: Bot, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current is not None:
+        return
+    text = (message.text or "").strip()
+    if not text:
+        return
+    try:
+        file_hash = await save_content("text", caption=text)
+        await reply_with_share_link(message, bot, file_hash, "text")
+    except Exception as exc:
+        logger.warning("Предупреждение: не удалось сохранить текст (%s).", exc)
+        await message.answer("Не удалось создать ссылку. Отправьте текст ещё раз.")
+        return
+    logger.info("Текст сохранён: hash=%s len=%s", file_hash, len(text))
 
 
 @admin_router.callback_query(F.data == "admin:add")

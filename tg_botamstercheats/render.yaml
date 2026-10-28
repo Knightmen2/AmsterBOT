@@ -14,5 +14,5 @@ services:
         sync: false
       - key: ADMIN_IDS
         value: "7479229021,823427049"
-      - key: MANDATORY_CHANNEL
-        value: "@dfgames2"
+      - key: MANDATORY_CHANNELS
+        value: "@amstercheats,@amstercloud"
