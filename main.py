@@ -84,8 +84,24 @@ ALLOWED_MEMBER_STATUSES = frozenset({"member", "creator", "administrator"})
 HASH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 CHANNEL_ID_RE = re.compile(r"^-?\d{5,20}$")
+INVITE_RE = re.compile(
+    r"^(?:https?://)?(?:t\.me|telegram\.me)/(?:\+|joinchat/)([A-Za-z0-9_-]+)/?$",
+    re.IGNORECASE,
+)
 NO_LINK = LinkPreviewOptions(is_disabled=True)
 MANDATORY_LOOKUP = {item.lower() for item in MANDATORY_CHANNELS}
+
+
+def normalize_invite_url(raw: str) -> str | None:
+    value = (raw or "").strip()
+    if not value:
+        return None
+    match = INVITE_RE.fullmatch(value)
+    if not match:
+        return None
+    code = match.group(1)
+    return f"https://t.me/+{code}"
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,6 +126,8 @@ admin_router.callback_query.filter(AdminFilter())
 class AdminStates(StatesGroup):
     add_channel = State()
     delete_channel = State()
+    set_link_channel = State()
+    set_link_url = State()
 
 
 def chat_target(channel: str) -> int | str:
@@ -122,6 +140,11 @@ def normalize_channel(raw: str) -> str | None:
     value = (raw or "").strip()
     if not value:
         return None
+
+    # Если в строке есть и канал, и invite — берём первый токен как канал.
+    if " " in value or "\n" in value:
+        first = re.split(r"\s+", value, maxsplit=1)[0]
+        return normalize_channel(first)
 
     lowered = value.lower()
     for prefix in ("https://t.me/", "http://t.me/", "https://telegram.me/", "t.me/"):
@@ -145,6 +168,39 @@ def normalize_channel(raw: str) -> str | None:
     return None
 
 
+def split_channel_and_invite(raw: str) -> tuple[str | None, str | None]:
+    """Разбор: '@channel' или '@channel https://t.me/+xxx'."""
+    text = (raw or "").strip()
+    if not text:
+        return None, None
+    parts = re.split(r"\s+", text, maxsplit=1)
+    channel = normalize_channel(parts[0])
+    invite = normalize_invite_url(parts[1]) if len(parts) > 1 else None
+    return channel, invite
+
+
+def _parse_button_links(raw: str) -> dict[str, str]:
+    """Формат: @channel=https://t.me/+xxx,@other=https://t.me/+yyy"""
+    result: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        left, right = part.split("=", 1)
+        channel = normalize_channel(left.strip())
+        invite = normalize_invite_url(right.strip())
+        if channel and invite:
+            result[channel.lower()] = invite
+    return result
+
+
+# Ссылки на кнопках подписки (invite/трекинг). Проверка подписки идёт по @каналу.
+_DEFAULT_BUTTON_LINKS = "@amstercheats=https://t.me/+9OI-NIb-CPozNDg6"
+BUTTON_LINKS: dict[str, str] = _parse_button_links(
+    os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
+)
+
+
 def member_status(member: object) -> str:
     status = getattr(member, "status", "")
     if hasattr(status, "value"):
@@ -158,6 +214,10 @@ async def db_conn() -> aiosqlite.Connection:
     return db
 
 
+def _invite_meta_key(channel: str) -> str:
+    return f"invite:{channel.lower()}"
+
+
 async def init_db() -> None:
     db = await db_conn()
     try:
@@ -166,7 +226,8 @@ async def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY,
-                channel_id TEXT
+                channel_id TEXT,
+                invite_url TEXT
             )
             """
         )
@@ -187,6 +248,34 @@ async def init_db() -> None:
             await db.commit()
         except sqlite3.OperationalError:
             pass
+        try:
+            await db.execute("ALTER TABLE channels ADD COLUMN invite_url TEXT")
+            await db.commit()
+        except sqlite3.OperationalError:
+            pass
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        await db.commit()
+        # Одноразовая очистка тестовых загрузок админов (wipe_files_v1).
+        cursor = await db.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("wipe_files_v1",),
+        )
+        wiped = await cursor.fetchone()
+        if wiped is None:
+            await db.execute("DELETE FROM files")
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                ("wipe_files_v1", "done"),
+            )
+            await db.commit()
+            logger.info("Очищены старые записи files (wipe_files_v1)")
         # Удаляем старые обязательные и дубликаты текущих обязательных из таблицы.
         cursor = await db.execute("SELECT id, channel_id FROM channels")
         rows = await cursor.fetchall()
@@ -195,8 +284,100 @@ async def init_db() -> None:
             if channel_id in _REMOVED_CHANNELS or channel_id in MANDATORY_LOOKUP:
                 await db.execute("DELETE FROM channels WHERE id = ?", (row["id"],))
         await db.commit()
+        # Дефолтные invite-ссылки для обязательных каналов (если ещё не заданы).
+        for channel, invite in BUTTON_LINKS.items():
+            key = _invite_meta_key(channel)
+            cursor = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
+            if await cursor.fetchone() is None:
+                await db.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    (key, invite),
+                )
+        await db.commit()
     finally:
         await db.close()
+
+
+async def get_invite_url(channel: str) -> str | None:
+    key = channel.lower()
+    if key in BUTTON_LINKS:
+        cached = BUTTON_LINKS[key]
+    else:
+        cached = None
+    db = await db_conn()
+    try:
+        # Сначала meta (обязательные и /setlink).
+        cursor = await db.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (_invite_meta_key(channel),),
+        )
+        row = await cursor.fetchone()
+        if row and row["value"]:
+            return str(row["value"])
+        # Затем колонка channels.invite_url.
+        cursor = await db.execute(
+            "SELECT invite_url FROM channels WHERE lower(channel_id) = ?",
+            (key,),
+        )
+        row = await cursor.fetchone()
+        if row and row["invite_url"]:
+            return str(row["invite_url"])
+    finally:
+        await db.close()
+    return cached
+
+
+async def set_invite_url(channel: str, invite: str | None) -> tuple[bool, str]:
+    channel_norm = normalize_channel(channel)
+    if channel_norm is None:
+        return False, "Отправьте юзернейм канала (с @) или числовой ID."
+    invite_norm = normalize_invite_url(invite) if invite else None
+    if invite and invite_norm is None:
+        return False, "Нужна invite-ссылка вида https://t.me/+XXXX"
+
+    key = channel_norm.lower()
+    db = await db_conn()
+    try:
+        if key in MANDATORY_LOOKUP:
+            meta_key = _invite_meta_key(channel_norm)
+            if invite_norm:
+                await db.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (meta_key, invite_norm),
+                )
+            else:
+                await db.execute("DELETE FROM meta WHERE key = ?", (meta_key,))
+            await db.commit()
+            if invite_norm:
+                BUTTON_LINKS[key] = invite_norm
+            else:
+                BUTTON_LINKS.pop(key, None)
+            text = (
+                f"Для {channel_norm} кнопка: {invite_norm}"
+                if invite_norm
+                else f"Invite-ссылка для {channel_norm} снята."
+            )
+            return True, text
+
+        cursor = await db.execute(
+            "SELECT id FROM channels WHERE lower(channel_id) = ?",
+            (key,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return False, "Канал не найден. Сначала добавьте его через /addchannel."
+        await db.execute(
+            "UPDATE channels SET invite_url = ? WHERE id = ?",
+            (invite_norm, row["id"]),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    if invite_norm:
+        return True, f"Для {channel_norm} кнопка: {invite_norm}"
+    return True, f"Invite-ссылка для {channel_norm} снята."
 
 
 async def required_channels() -> list[str]:
@@ -220,29 +401,59 @@ async def required_channels() -> list[str]:
 async def list_channels() -> list[sqlite3.Row]:
     db = await db_conn()
     try:
-        cursor = await db.execute("SELECT id, channel_id FROM channels ORDER BY id")
+        cursor = await db.execute(
+            "SELECT id, channel_id, invite_url FROM channels ORDER BY id"
+        )
         return await cursor.fetchall()
     finally:
         await db.close()
 
 
 async def add_channel(raw: str, bot: Bot | None = None) -> tuple[bool, str]:
-    channel = normalize_channel(raw)
+    channel, invite = split_channel_and_invite(raw)
     if channel is None:
-        return False, "Отправьте юзернейм канала (с @) или числовой ID."
+        # Чистая invite без @ — не подходит для проверки подписки.
+        if normalize_invite_url(raw.strip().split()[0] if raw.strip() else ""):
+            return (
+                False,
+                "Invite-ссылка одна не подходит.\n"
+                "Добавляйте так:\n"
+                "@channel https://t.me/+XXXX\n"
+                "Проверка — по @каналу, кнопка — по invite.",
+            )
+        return (
+            False,
+            "Отправьте юзернейм канала (с @) или числовой ID.\n"
+            "Можно сразу с invite: @channel https://t.me/+XXXX",
+        )
+    if len(raw.strip().split()) > 1 and invite is None:
+        return False, "Вторая часть должна быть invite-ссылкой https://t.me/+XXXX"
 
     current = await required_channels()
     if any(channel.lower() == item.lower() for item in current):
+        if invite:
+            ok, text = await set_invite_url(channel, invite)
+            return ok, ("Канал уже есть. " + text) if ok else text
         return False, "Этот канал уже есть в списке проверки."
 
     db = await db_conn()
     try:
-        await db.execute("INSERT INTO channels (channel_id) VALUES (?)", (channel,))
+        await db.execute(
+            "INSERT INTO channels (channel_id, invite_url) VALUES (?, ?)",
+            (channel, invite),
+        )
         await db.commit()
     finally:
         await db.close()
 
     text = f"Канал {channel} добавлен."
+    if invite:
+        text += f"\nКнопка: {invite}"
+    else:
+        text += (
+            "\nПодсказка: для трекинга задайте invite-ссылку:\n"
+            f"/setlink {channel} https://t.me/+XXXX"
+        )
     probe_user = next(iter(ADMIN_IDS), 0)
     if bot is not None and probe_user and await is_subscribed(bot, probe_user, channel) is None:
         text += (
@@ -292,7 +503,6 @@ async def delete_channel_by_id(channel_pk: int) -> str | None:
         return str(row["channel_id"])
     finally:
         await db.close()
-
 
 async def save_content(
     file_type: str,
@@ -384,14 +594,29 @@ def gate_text(failed: list[str]) -> str:
     )
 
 
-def channel_list_text(rows: list[sqlite3.Row]) -> str:
+async def channel_list_text(rows: list[sqlite3.Row]) -> str:
     lines = ["Обязательные каналы:"]
-    lines.extend(f"• {channel}" for channel in MANDATORY_CHANNELS)
+    for channel in MANDATORY_CHANNELS:
+        invite = await get_invite_url(channel)
+        if invite:
+            lines.append(f"• {channel}\n  кнопка: {invite}")
+        else:
+            lines.append(f"• {channel}")
     if not rows:
         lines.append("Дополнительные каналы не добавлены.")
         return "\n".join(lines)
     lines.append("Дополнительные каналы:")
-    lines.extend(f"• {row['channel_id']}" for row in rows)
+    for row in rows:
+        channel_id = row["channel_id"]
+        try:
+            invite = row["invite_url"]
+        except (KeyError, IndexError):
+            invite = None
+        invite = invite or await get_invite_url(str(channel_id))
+        if invite:
+            lines.append(f"• {channel_id}\n  кнопка: {invite}")
+        else:
+            lines.append(f"• {channel_id}")
     return "\n".join(lines)
 
 
@@ -399,6 +624,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Добавить канал", callback_data="admin:add")],
+            [InlineKeyboardButton(text="Ссылка кнопки", callback_data="admin:link")],
             [InlineKeyboardButton(text="Удалить канал", callback_data="admin:del")],
             [InlineKeyboardButton(text="Список каналов", callback_data="admin:list")],
         ]
@@ -419,22 +645,26 @@ def delete_keyboard(rows: list[sqlite3.Row]) -> InlineKeyboardMarkup:
 
 async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
     title = channel
-    url: str | None = f"https://t.me/{channel[1:]}" if channel.startswith("@") else None
-    if url is None:
-        try:
-            chat = await bot.get_chat(chat_target(channel))
-        except Exception as exc:
-            logger.warning(
-                "Предупреждение: не удалось получить ссылку на канал %s (%s).",
-                channel,
-                exc,
-            )
-        else:
-            title = chat.title or channel
+    # Приоритет: invite/трекинг-ссылка (как хочет заказчик).
+    url: str | None = await get_invite_url(channel)
+    try:
+        chat = await bot.get_chat(chat_target(channel))
+    except Exception as exc:
+        logger.warning(
+            "Предупреждение: не удалось получить данные канала %s (%s).",
+            channel,
+            exc,
+        )
+        chat = None
+    if chat is not None:
+        title = chat.title or channel
+        if url is None:
             if chat.username:
                 url = f"https://t.me/{chat.username}"
             elif chat.invite_link:
                 url = chat.invite_link
+    if url is None and channel.startswith("@"):
+        url = f"https://t.me/{channel[1:]}"
     title = (title or channel).strip()
     if len(title) > 60:
         title = title[:57] + "..."
@@ -648,9 +878,9 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         "Админ-панель.\n"
-        "• Файл (документ/фото/видео) — ссылка на файл\n"
-        "• Файл с подписью — файл + текст пользователю\n"
-        "• Просто текст — ссылка только на текст",
+        "• Файл / текст — ссылка для раздачи\n"
+        "• Каналы: проверка по @, кнопка может быть invite (t.me/+…)\n"
+        "• /setlink @channel https://t.me/+XXXX — ссылка в кнопке",
         reply_markup=admin_keyboard(),
     )
 
@@ -658,7 +888,7 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
 @admin_router.message(Command("channels"))
 async def cmd_channels(message: Message) -> None:
     rows = await list_channels()
-    await message.answer(channel_list_text(rows), reply_markup=admin_keyboard())
+    await message.answer(await channel_list_text(rows), reply_markup=admin_keyboard())
 
 
 def command_argument(command: CommandObject) -> str:
@@ -667,17 +897,56 @@ def command_argument(command: CommandObject) -> str:
     return command.args.strip().split(maxsplit=1)[0].strip(",;")
 
 
+def command_full_args(command: CommandObject) -> str:
+    return (command.args or "").strip()
+
+
 @admin_router.message(Command("addchannel"))
 async def cmd_addchannel(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
-    argument = command_argument(command)
+    argument = command_full_args(command)
     if argument:
         await state.clear()
         ok, text = await add_channel(argument, bot)
         await message.answer(text, reply_markup=admin_keyboard() if ok else None)
         return
     await state.set_state(AdminStates.add_channel)
-    await message.answer("Отправьте юзернейм канала (с @) или его числовой ID.\nОтмена — /cancel")
+    await message.answer(
+        "Отправьте юзернейм канала (с @) или ID.\n"
+        "С invite для кнопки:\n"
+        "@channel https://t.me/+XXXX\n"
+        "Отмена — /cancel"
+    )
 
+
+@admin_router.message(Command("setlink"))
+async def cmd_setlink(message: Message, command: CommandObject, state: FSMContext) -> None:
+    argument = command_full_args(command)
+    if argument:
+        channel, invite = split_channel_and_invite(argument)
+        if channel and invite:
+            await state.clear()
+            ok, text = await set_invite_url(channel, invite)
+            await message.answer(text, reply_markup=admin_keyboard() if ok else None)
+            return
+        if channel and not invite and len(argument.split()) == 1:
+            await state.clear()
+            await state.update_data(set_link_channel=channel)
+            await state.set_state(AdminStates.set_link_url)
+            await message.answer(
+                f"Канал {channel}.\n"
+                "Отправьте invite-ссылку https://t.me/+XXXX\n"
+                "Отмена — /cancel"
+            )
+            return
+        await message.answer(
+            "Формат:\n/setlink @channel https://t.me/+XXXX\n"
+            "Или только /setlink @channel — потом пришлёте ссылку."
+        )
+        return
+    await state.set_state(AdminStates.set_link_channel)
+    await message.answer(
+        "Отправьте @канал (или ID), для которого задать ссылку кнопки.\nОтмена — /cancel"
+    )
 
 @admin_router.message(Command("delchannel"))
 async def cmd_delchannel(message: Message, command: CommandObject, state: FSMContext) -> None:
@@ -712,6 +981,40 @@ async def on_add_channel_text(message: Message, state: FSMContext, bot: Bot) -> 
     await message.answer(text)
 
 
+@admin_router.message(AdminStates.set_link_channel, F.text, ~F.text.startswith("/"))
+async def on_set_link_channel(message: Message, state: FSMContext) -> None:
+    channel, invite = split_channel_and_invite(message.text or "")
+    if channel is None:
+        await message.answer("Нужен @юзернейм или числовой ID канала.")
+        return
+    if invite:
+        await state.clear()
+        ok, text = await set_invite_url(channel, invite)
+        await message.answer(text, reply_markup=admin_keyboard() if ok else None)
+        return
+    await state.update_data(set_link_channel=channel)
+    await state.set_state(AdminStates.set_link_url)
+    await message.answer(
+        f"Канал {channel}.\nОтправьте invite-ссылку https://t.me/+XXXX\nОтмена — /cancel"
+    )
+
+
+@admin_router.message(AdminStates.set_link_url, F.text, ~F.text.startswith("/"))
+async def on_set_link_url(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    channel = data.get("set_link_channel")
+    if not channel:
+        await state.clear()
+        await message.answer("Начните заново: /setlink")
+        return
+    ok, text = await set_invite_url(str(channel), message.text or "")
+    if ok:
+        await state.clear()
+        await message.answer(text, reply_markup=admin_keyboard())
+        return
+    await message.answer(text)
+
+
 @admin_router.message(AdminStates.delete_channel, F.text, ~F.text.startswith("/"))
 async def on_delete_channel_text(message: Message, state: FSMContext) -> None:
     ok, text = await delete_channel_by_ref(message.text or "")
@@ -720,7 +1023,6 @@ async def on_delete_channel_text(message: Message, state: FSMContext) -> None:
         await message.answer(text, reply_markup=admin_keyboard())
         return
     await message.answer(text)
-
 
 @admin_router.message(
     F.content_type.in_({"document", "video", "photo"}),
@@ -768,7 +1070,25 @@ async def admin_text(message: Message, bot: Bot, state: FSMContext) -> None:
 async def cb_admin_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminStates.add_channel)
     await callback.answer()
-    await notify(callback, "Отправьте юзернейм канала (с @) или его числовой ID.\nОтмена — /cancel")
+    await notify(
+        callback,
+        "Отправьте юзернейм канала (с @) или ID.\n"
+        "С invite для кнопки:\n"
+        "@channel https://t.me/+XXXX\n"
+        "Отмена — /cancel",
+    )
+
+
+@admin_router.callback_query(F.data == "admin:link")
+async def cb_admin_link(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminStates.set_link_channel)
+    await callback.answer()
+    await notify(
+        callback,
+        "Отправьте @канал (или ID), для которого задать ссылку кнопки.\n"
+        "Можно сразу: @channel https://t.me/+XXXX\n"
+        "Отмена — /cancel",
+    )
 
 
 @admin_router.callback_query(F.data == "admin:list")
@@ -776,8 +1096,7 @@ async def cb_admin_list(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     rows = await list_channels()
     await callback.answer()
-    await notify(callback, channel_list_text(rows), reply_markup=admin_keyboard())
-
+    await notify(callback, await channel_list_text(rows), reply_markup=admin_keyboard())
 
 @admin_router.callback_query(F.data == "admin:del")
 async def cb_admin_del(callback: CallbackQuery, state: FSMContext) -> None:
@@ -809,7 +1128,7 @@ async def cb_delete_channel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.answer("Канал удалён")
     rows = await list_channels()
-    text = f"Канал {deleted} удалён.\n\n{channel_list_text(rows)}"
+    text = f"Канал {deleted} удалён.\n\n{await channel_list_text(rows)}"
     if isinstance(callback.message, Message):
         try:
             await callback.message.edit_text(text, reply_markup=admin_keyboard())
@@ -824,6 +1143,7 @@ async def setup_admin_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Получить файл"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="addchannel", description="Добавить канал"),
+        BotCommand(command="setlink", description="Ссылка кнопки канала"),
         BotCommand(command="delchannel", description="Удалить канал"),
         BotCommand(command="channels", description="Список каналов"),
         BotCommand(command="cancel", description="Отмена"),
