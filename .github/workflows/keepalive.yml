@@ -1,0 +1,28 @@
+# Пинг Render каждые 5 минут без включённого ПК.
+# В GitHub → Settings → Secrets and variables → Actions
+# добавьте секрет KEEP_ALIVE_URL = https://ВАШ-СЕРВИС.onrender.com
+
+name: Keep Render Awake
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render
+        env:
+          KEEP_ALIVE_URL: ${{ secrets.KEEP_ALIVE_URL }}
+        run: |
+          if [ -z "$KEEP_ALIVE_URL" ]; then
+            echo "Секрет KEEP_ALIVE_URL не задан"
+            exit 1
+          fi
+          URL="${KEEP_ALIVE_URL%/}/"
+          echo "GET $URL"
+          curl -fsS -A "bcwallfiles-keepalive/1.0" -o /tmp/keepalive.out -w "HTTP %{http_code}\n" "$URL"
+          head -c 64 /tmp/keepalive.out || true
+          echo
