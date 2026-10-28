@@ -194,10 +194,20 @@ def _parse_button_links(raw: str) -> dict[str, str]:
     return result
 
 
-# Ссылки на кнопках подписки (invite/трекинг). Проверка подписки идёт по @каналу.
-_DEFAULT_BUTTON_LINKS = "@amstercheats=https://t.me/+9OI-NIb-CPozNDg6"
+# Ссылки на кнопках (invite/трекинг). Проверка подписки идёт по @каналу.
+_CORRECT_AMSTER_INVITE = "https://t.me/+9OI-Nlb-CpozNDg6"
+_DEFAULT_BUTTON_LINKS = f"@amstercheats={_CORRECT_AMSTER_INVITE}"
 BUTTON_LINKS: dict[str, str] = _parse_button_links(
     os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
+)
+
+# Опечатки в invite (I/l, P/p), которые нужно заменить на правильную ссылку.
+_WRONG_INVITE_CODES = frozenset(
+    {
+        "9OI-NIb-CPozNDg6",
+        "9OI-NIb-CpozNDg6",
+        "9OI-Nlb-CPozNDg6",
+    }
 )
 
 
@@ -284,7 +294,7 @@ async def init_db() -> None:
             if channel_id in _REMOVED_CHANNELS or channel_id in MANDATORY_LOOKUP:
                 await db.execute("DELETE FROM channels WHERE id = ?", (row["id"],))
         await db.commit()
-        # Дефолтные invite-ссылки для обязательных каналов (если ещё не заданы).
+        # Invite из env/дефолта — только если ещё не заданы в meta.
         for channel, invite in BUTTON_LINKS.items():
             key = _invite_meta_key(channel)
             cursor = await db.execute("SELECT value FROM meta WHERE key = ?", (key,))
@@ -294,6 +304,34 @@ async def init_db() -> None:
                     (key, invite),
                 )
         await db.commit()
+        # Одноразово поправить опечатку в invite @amstercheats (I→l).
+        cursor = await db.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("fix_amster_invite_v2",),
+        )
+        if await cursor.fetchone() is None:
+            amster_key = _invite_meta_key("@amstercheats")
+            cursor = await db.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (amster_key,),
+            )
+            row = await cursor.fetchone()
+            current = (row["value"] if row else "") or ""
+            match = INVITE_RE.fullmatch(current.strip()) if current else None
+            code = match.group(1) if match else ""
+            if not current or code in _WRONG_INVITE_CODES:
+                await db.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (amster_key, _CORRECT_AMSTER_INVITE),
+                )
+                logger.info("Исправлен invite @amstercheats → %s", _CORRECT_AMSTER_INVITE)
+                BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                ("fix_amster_invite_v2", "done"),
+            )
+            await db.commit()
     finally:
         await db.close()
 
