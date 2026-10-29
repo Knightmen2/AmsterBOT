@@ -7,8 +7,9 @@
 Render (Web Service):
     Build: pip install -r requirements.txt
     Start: python -u main.py
-    Env: BOT_TOKEN, ADMIN_IDS, MANDATORY_CHANNELS
-    Бесплатный тариф засыпает ~15 минут без HTTP — пингуйте URL или Background Worker.
+    Env: BOT_TOKEN, ADMIN_IDS, MANDATORY_CHANNELS,
+         TURSO_DATABASE_URL, TURSO_AUTH_TOKEN (чтобы база не пропадала на Render)
+    Бесплатный тариф засыпает ~15 минут без HTTP — пингуйте URL (UptimeRobot).
 
 Бот должен быть администратором обязательного канала и каждого канала из админки,
 иначе get_chat_member недоступен.
@@ -26,6 +27,12 @@ import sys
 from pathlib import Path
 
 import aiosqlite
+
+try:
+    import turso_serverless
+except ImportError:  # локально без пакета — только sqlite-файл
+    turso_serverless = None  # type: ignore
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -80,6 +87,9 @@ if not MANDATORY_CHANNELS:
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "bot.db"
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "").strip()
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+USE_TURSO = bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
 ALLOWED_MEMBER_STATUSES = frozenset({"member", "creator", "administrator"})
 HASH_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
@@ -218,7 +228,57 @@ def member_status(member: object) -> str:
     return str(status)
 
 
-async def db_conn() -> aiosqlite.Connection:
+class _AsyncCursor:
+    """Обёртка sync-курсора Turso под await fetchone/fetchall."""
+
+    def __init__(self, cursor: object) -> None:
+        self._cursor = cursor
+
+    async def fetchone(self):
+        return await asyncio.to_thread(self._cursor.fetchone)
+
+    async def fetchall(self):
+        return await asyncio.to_thread(self._cursor.fetchall)
+
+
+class _AsyncTursoConn:
+    """Async-обёртка над turso_serverless (HTTP), API как у aiosqlite."""
+
+    def __init__(self, conn: object) -> None:
+        self._conn = conn
+
+    async def execute(self, sql: str, params: tuple | list = ()):
+        cursor = await asyncio.to_thread(self._conn.execute, sql, params)
+        return _AsyncCursor(cursor)
+
+    async def commit(self) -> None:
+        await asyncio.to_thread(self._conn.commit)
+
+    async def close(self) -> None:
+        close = getattr(self._conn, "close", None)
+        if callable(close):
+            await asyncio.to_thread(close)
+
+
+def _open_turso_sync():
+    if turso_serverless is None:
+        raise RuntimeError("Установите turso_serverless: pip install turso_serverless")
+    conn = turso_serverless.connect(
+        TURSO_DATABASE_URL,
+        auth_token=TURSO_AUTH_TOKEN,
+    )
+    # Row по имени колонки, как aiosqlite.Row
+    try:
+        conn.row_factory = turso_serverless.Row
+    except Exception:
+        pass
+    return conn
+
+
+async def db_conn():
+    if USE_TURSO:
+        conn = await asyncio.to_thread(_open_turso_sync)
+        return _AsyncTursoConn(conn)
     db = await aiosqlite.connect(DB_PATH, timeout=30)
     db.row_factory = aiosqlite.Row
     return db
@@ -231,7 +291,8 @@ def _invite_meta_key(channel: str) -> str:
 async def init_db() -> None:
     db = await db_conn()
     try:
-        await db.execute("PRAGMA journal_mode=WAL")
+        if not USE_TURSO:
+            await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS channels (
@@ -253,15 +314,18 @@ async def init_db() -> None:
             """
         )
         await db.commit()
+        _alter_errors: tuple = (sqlite3.OperationalError,)
+        if turso_serverless is not None:
+            _alter_errors = (sqlite3.OperationalError, turso_serverless.OperationalError)
         try:
             await db.execute("ALTER TABLE files ADD COLUMN caption TEXT")
             await db.commit()
-        except sqlite3.OperationalError:
+        except _alter_errors:
             pass
         try:
             await db.execute("ALTER TABLE channels ADD COLUMN invite_url TEXT")
             await db.commit()
-        except sqlite3.OperationalError:
+        except _alter_errors:
             pass
         await db.execute(
             """
@@ -573,6 +637,12 @@ async def save_content(
                 return file_hash
             except sqlite3.IntegrityError:
                 continue
+            except Exception as exc:
+                if turso_serverless is not None and isinstance(
+                    exc, turso_serverless.IntegrityError
+                ):
+                    continue
+                raise
     finally:
         await db.close()
     raise RuntimeError("Не удалось создать уникальный хэш")
@@ -1257,7 +1327,10 @@ async def main() -> None:
     try:
         me = await bot.get_me()
         await setup_admin_commands(bot)
-        logger.info("Бот @%s запущен (db=%s)", me.username, DB_PATH)
+        db_label = (
+            f"turso:{TURSO_DATABASE_URL}" if USE_TURSO else f"sqlite:{DB_PATH}"
+        )
+        logger.info("Бот @%s запущен (db=%s)", me.username, db_label)
         await dp.start_polling(bot)
     finally:
         health_task.cancel()
