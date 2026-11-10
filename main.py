@@ -24,6 +24,7 @@ import re
 import secrets
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -35,7 +36,7 @@ except ImportError:  # локально без пакета — только sql
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -48,6 +49,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     Message,
+    User,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8573398640:AAELCe9o54NX2Tm0Dsewcxln2ytDhHpuA_I").strip()
@@ -138,6 +140,7 @@ class AdminStates(StatesGroup):
     delete_channel = State()
     set_link_channel = State()
     set_link_url = State()
+    wait_ad_post = State()
 
 
 def chat_target(channel: str) -> int | str:
@@ -332,6 +335,16 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_seen TEXT,
+                last_seen TEXT
             )
             """
         )
@@ -660,6 +673,90 @@ async def get_file(file_hash: str) -> sqlite3.Row | None:
         await db.close()
 
 
+async def touch_user(user: User | None) -> None:
+    """Запоминаем пользователя для /info и рассылки /ad (хранится в Turso)."""
+    if user is None:
+        return
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    username = (user.username or "").strip() or None
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user.id,),
+        )
+        exists = await cursor.fetchone()
+        if exists is None:
+            await db.execute(
+                """
+                INSERT INTO users (user_id, username, first_seen, last_seen)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user.id, username, now, now),
+            )
+        else:
+            await db.execute(
+                """
+                UPDATE users SET username = ?, last_seen = ? WHERE user_id = ?
+                """,
+                (username, now, user.id),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def count_files() -> int:
+    db = await db_conn()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) AS c FROM files")
+        row = await cursor.fetchone()
+        return int(row["c"] if row else 0)
+    finally:
+        await db.close()
+
+
+async def count_users() -> int:
+    db = await db_conn()
+    try:
+        cursor = await db.execute("SELECT COUNT(*) AS c FROM users")
+        row = await cursor.fetchone()
+        return int(row["c"] if row else 0)
+    finally:
+        await db.close()
+
+
+async def list_user_ids() -> list[int]:
+    db = await db_conn()
+    try:
+        cursor = await db.execute("SELECT user_id FROM users ORDER BY user_id")
+        rows = await cursor.fetchall()
+        return [int(row["user_id"]) for row in rows]
+    finally:
+        await db.close()
+
+
+async def delete_user(user_id: int) -> None:
+    db = await db_conn()
+    try:
+        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def bot_stats_text() -> str:
+    files_n = await count_files()
+    channels_n = len(await required_channels())
+    users_n = await count_users()
+    return (
+        "Статистика бота:\n"
+        f"Загружено {files_n} файлов\n"
+        f"Используется {channels_n} каналов\n"
+        f"Запускало {users_n} пользователей"
+    )
+
+
 async def is_subscribed(bot: Bot, user_id: int, channel: str) -> bool | None:
     try:
         member = await bot.get_chat_member(chat_id=chat_target(channel), user_id=user_id)
@@ -781,8 +878,14 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=title, callback_data="channel:nolink")
 
 
-async def build_subscribe_keyboard(bot: Bot, file_hash: str) -> InlineKeyboardMarkup:
-    rows = [[await channel_button(bot, channel)] for channel in await required_channels()]
+async def build_subscribe_keyboard(
+    bot: Bot,
+    file_hash: str,
+    channels: list[str] | None = None,
+) -> InlineKeyboardMarkup:
+    # Только каналы, на которые ещё не подписан (и те, что не удалось проверить).
+    targets = channels if channels is not None else await required_channels()
+    rows = [[await channel_button(bot, channel)] for channel in targets]
     rows.append(
         [InlineKeyboardButton(text="Проверить подписку", callback_data=f"check_sub:{file_hash}")]
     )
@@ -875,7 +978,7 @@ async def deliver_or_gate(bot: Bot, chat_id: int, user_id: int, file_hash: str, 
     if not missing and not failed:
         await send_stored_content(bot, chat_id, row)
         return None
-    keyboard = await build_subscribe_keyboard(bot, file_hash)
+    keyboard = await build_subscribe_keyboard(bot, file_hash, missing + failed)
     return gate_text(failed), keyboard
 
 
@@ -888,6 +991,8 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext,
 
     if message.from_user is None:
         return
+
+    await touch_user(message.from_user)
 
     if not payload:
         if message.from_user.id in ADMIN_IDS:
@@ -934,9 +1039,10 @@ async def cb_check_sub(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Файл не найден", show_alert=True)
         return
 
+    await touch_user(callback.from_user)
     missing, failed = await check_subscriptions(bot, callback.from_user.id)
     if missing or failed:
-        keyboard = await build_subscribe_keyboard(bot, file_hash)
+        keyboard = await build_subscribe_keyboard(bot, file_hash, missing + failed)
         if isinstance(callback.message, Message):
             try:
                 await callback.message.edit_text(gate_text(failed), reply_markup=keyboard)
@@ -988,7 +1094,79 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
         "Админ-панель.\n"
         "• Файл / текст — ссылка для раздачи\n"
         "• Каналы: проверка по @, кнопка может быть invite (t.me/+…)\n"
-        "• /setlink @channel https://t.me/+XXXX — ссылка в кнопке",
+        "• /setlink @channel https://t.me/+XXXX — ссылка в кнопке\n"
+        "• /info — статистика\n"
+        "• /ad — рассылка поста всем пользователям",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@admin_router.message(Command("info"))
+async def cmd_info(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(await bot_stats_text(), reply_markup=admin_keyboard())
+
+
+@admin_router.message(Command("ad"))
+async def cmd_ad(message: Message, state: FSMContext) -> None:
+    await state.set_state(AdminStates.wait_ad_post)
+    await message.answer(
+        "Отправьте пост для рассылки.\n"
+        "Поддерживаются текст (с форматированием), фото, видео, документы, подписи.\n"
+        "Отмена — /cancel"
+    )
+
+
+@admin_router.message(AdminStates.wait_ad_post, F.content_type.in_({
+    "text", "photo", "video", "document", "animation", "audio", "voice", "video_note", "sticker",
+}))
+async def on_ad_post(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.text and message.text.startswith("/"):
+        return
+    await state.clear()
+    user_ids = await list_user_ids()
+    if not user_ids:
+        await message.answer(
+            "Некому рассылать: пока никто не запускал бота.\n"
+            "Счётчик начнёт расти после /start у пользователей.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    await message.answer(f"Рассылка началась ({len(user_ids)} получателей)…")
+    ok = 0
+    fail = 0
+    for uid in user_ids:
+        if uid == message.from_user.id:
+            continue
+        try:
+            await bot.copy_message(
+                chat_id=uid,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+            ok += 1
+        except TelegramForbiddenError:
+            fail += 1
+            await delete_user(uid)
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(float(exc.retry_after) + 0.5)
+            try:
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
+                ok += 1
+            except Exception:
+                fail += 1
+        except Exception as exc:
+            fail += 1
+            logger.warning("Рассылка user_id=%s не удалась (%s).", uid, exc)
+        await asyncio.sleep(0.05)
+
+    await message.answer(
+        f"Рассылка завершена.\nДоставлено: {ok}\nНе доставлено: {fail}",
         reply_markup=admin_keyboard(),
     )
 
@@ -1135,7 +1313,10 @@ async def on_delete_channel_text(message: Message, state: FSMContext) -> None:
 @admin_router.message(
     F.content_type.in_({"document", "video", "photo"}),
 )
-async def admin_file(message: Message, bot: Bot) -> None:
+async def admin_file(message: Message, bot: Bot, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current is not None:
+        return
     extracted = extract_file(message)
     if extracted is None:
         return
@@ -1250,6 +1431,8 @@ async def setup_admin_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="start", description="Получить файл"),
         BotCommand(command="admin", description="Админ-панель"),
+        BotCommand(command="info", description="Статистика бота"),
+        BotCommand(command="ad", description="Рассылка поста"),
         BotCommand(command="addchannel", description="Добавить канал"),
         BotCommand(command="setlink", description="Ссылка кнопки канала"),
         BotCommand(command="delchannel", description="Удалить канал"),
