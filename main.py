@@ -137,6 +137,7 @@ admin_router.callback_query.filter(AdminFilter())
 
 class AdminStates(StatesGroup):
     add_channel = State()
+    add_channel_resolve = State()  # invite есть, ждём forward/ID канала
     delete_channel = State()
     set_link_channel = State()
     set_link_url = State()
@@ -182,14 +183,48 @@ def normalize_channel(raw: str) -> str | None:
 
 
 def split_channel_and_invite(raw: str) -> tuple[str | None, str | None]:
-    """Разбор: '@channel' или '@channel https://t.me/+xxx'."""
+    """Разбор: '@channel' | '@channel https://t.me/+xxx' | 'https://t.me/+xxx' | '-100… +ссылка'."""
     text = (raw or "").strip()
     if not text:
         return None, None
+
+    # Одна invite-ссылка без @.
+    if len(re.split(r"\s+", text)) == 1:
+        invite_only = normalize_invite_url(text)
+        if invite_only:
+            return None, invite_only
+        return normalize_channel(text), None
+
     parts = re.split(r"\s+", text, maxsplit=1)
+    first_invite = normalize_invite_url(parts[0])
+    if first_invite:
+        # https://t.me/+xxx @channel  или  +ссылка -100id
+        return normalize_channel(parts[1]), first_invite
+
     channel = normalize_channel(parts[0])
     invite = normalize_invite_url(parts[1]) if len(parts) > 1 else None
     return channel, invite
+
+
+def channel_from_forward(message: Message) -> str | None:
+    """Достаём канал из пересланного поста (для приватных без @)."""
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is not None and getattr(chat, "type", None) in {"channel", "supergroup"}:
+        if getattr(chat, "username", None):
+            return f"@{chat.username}"
+        return str(chat.id)
+
+    origin = getattr(message, "forward_origin", None)
+    if origin is not None:
+        origin_chat = getattr(origin, "chat", None)
+        if origin_chat is not None and getattr(origin_chat, "type", None) in {
+            "channel",
+            "supergroup",
+        }:
+            if getattr(origin_chat, "username", None):
+                return f"@{origin_chat.username}"
+            return str(origin_chat.id)
+    return None
 
 
 def _parse_button_links(raw: str) -> dict[str, str]:
@@ -524,26 +559,26 @@ async def list_channels() -> list[sqlite3.Row]:
         await db.close()
 
 
-async def add_channel(raw: str, bot: Bot | None = None) -> tuple[bool, str]:
-    channel, invite = split_channel_and_invite(raw)
-    if channel is None:
-        # Чистая invite без @ — не подходит для проверки подписки.
-        if normalize_invite_url(raw.strip().split()[0] if raw.strip() else ""):
-            return (
-                False,
-                "Invite-ссылка одна не подходит.\n"
-                "Добавляйте так:\n"
-                "@channel https://t.me/+XXXX\n"
-                "Проверка — по @каналу, кнопка — по invite.",
-            )
-        return (
-            False,
-            "Отправьте юзернейм канала (с @) или числовой ID.\n"
-            "Можно сразу с invite: @channel https://t.me/+XXXX",
-        )
-    if len(raw.strip().split()) > 1 and invite is None:
-        return False, "Вторая часть должна быть invite-ссылкой https://t.me/+XXXX"
+async def try_resolve_channel(bot: Bot, channel: str | None, invite: str | None) -> str | None:
+    """Пытаемся получить @username или numeric id для проверки подписки."""
+    if channel:
+        return channel
+    if not invite:
+        return None
+    for candidate in (invite, invite.removeprefix("https://"), invite.removeprefix("http://")):
+        try:
+            chat = await bot.get_chat(candidate)
+        except Exception:
+            continue
+        if getattr(chat, "username", None):
+            return f"@{chat.username}"
+        chat_id = getattr(chat, "id", None)
+        if chat_id is not None:
+            return str(chat_id)
+    return None
 
+
+async def insert_channel(channel: str, invite: str | None, bot: Bot | None = None) -> tuple[bool, str]:
     current = await required_channels()
     if any(channel.lower() == item.lower() for item in current):
         if invite:
@@ -573,9 +608,49 @@ async def add_channel(raw: str, bot: Bot | None = None) -> tuple[bool, str]:
     if bot is not None and probe_user and await is_subscribed(bot, probe_user, channel) is None:
         text += (
             "\nПредупреждение: бот не может проверить этот канал. "
-            "Добавьте его администратором."
+            "Добавьте бота администратором канала."
         )
     return True, text
+
+
+async def add_channel(raw: str, bot: Bot | None = None) -> tuple[bool, str, str | None]:
+    """
+    Возвращает (ok, text, pending_invite).
+    pending_invite != None — нужна вторая шага (forward/ID), канал ещё не записан.
+    """
+    channel, invite = split_channel_and_invite(raw)
+    if channel is None and invite is None:
+        return (
+            False,
+            "Форматы:\n"
+            "• @channel\n"
+            "• @channel https://t.me/+XXXX\n"
+            "• https://t.me/+XXXX  (только invite)\n"
+            "• -100… https://t.me/+XXXX",
+            None,
+        )
+    if channel is None and invite is not None:
+        if bot is None:
+            return (
+                False,
+                "Для invite без @ нужен бот: перешлите пост из канала или укажите ID.",
+                invite,
+            )
+        resolved = await try_resolve_channel(bot, None, invite)
+        if resolved is None:
+            return (
+                False,
+                "Ссылка принята. Бот должен быть админом канала.\n"
+                "Перешлите сюда любой пост из этого канала\n"
+                "или отправьте числовой ID (-100…).\n"
+                "Отмена — /cancel",
+                invite,
+            )
+        channel = resolved
+
+    assert channel is not None
+    ok, text = await insert_channel(channel, invite, bot)
+    return ok, text, None
 
 
 async def delete_channel_by_ref(raw: str) -> tuple[bool, str]:
@@ -852,6 +927,7 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
     title = channel
     # Приоритет: invite/трекинг-ссылка (как хочет заказчик).
     url: str | None = await get_invite_url(channel)
+    chat = None
     try:
         chat = await bot.get_chat(chat_target(channel))
     except Exception as exc:
@@ -860,7 +936,6 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
             channel,
             exc,
         )
-        chat = None
     if chat is not None:
         title = chat.title or channel
         if url is None:
@@ -868,6 +943,25 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
                 url = f"https://t.me/{chat.username}"
             elif chat.invite_link:
                 url = chat.invite_link
+            else:
+                # Приватный канал без сохранённой ссылки — создаём invite ботом.
+                try:
+                    url = await bot.export_chat_invite_link(chat.id)
+                except Exception:
+                    try:
+                        created = await bot.create_chat_invite_link(
+                            chat_id=chat.id,
+                            name="amsterbot",
+                        )
+                        url = created.invite_link
+                    except Exception as exc:
+                        logger.warning(
+                            "Не удалось создать invite для %s (%s).",
+                            channel,
+                            exc,
+                        )
+                if url:
+                    await set_invite_url(channel, url)
     if url is None and channel.startswith("@"):
         url = f"https://t.me/{channel[1:]}"
     title = (title or channel).strip()
@@ -1040,24 +1134,37 @@ async def cb_check_sub(callback: CallbackQuery, bot: Bot) -> None:
         return
 
     await touch_user(callback.from_user)
-    missing, failed = await check_subscriptions(bot, callback.from_user.id)
+    try:
+        missing, failed = await check_subscriptions(bot, callback.from_user.id)
+    except Exception as exc:
+        logger.warning("Ошибка проверки подписки (%s).", exc)
+        await callback.answer("Ошибка проверки. Попробуйте ещё раз.", show_alert=True)
+        return
+
     if missing or failed:
         keyboard = await build_subscribe_keyboard(bot, file_hash, missing + failed)
+        text = gate_text(failed)
         if isinstance(callback.message, Message):
             try:
-                await callback.message.edit_text(gate_text(failed), reply_markup=keyboard)
+                await callback.message.edit_text(text, reply_markup=keyboard)
             except TelegramBadRequest:
-                pass
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=keyboard)
+                except TelegramBadRequest:
+                    try:
+                        await callback.message.answer(text, reply_markup=keyboard)
+                    except Exception:
+                        pass
         if missing:
-            await callback.answer("Вы подписались не на все каналы", show_alert=True)
+            await callback.answer("Подпишитесь на оставшиеся каналы", show_alert=True)
         else:
             await callback.answer(
-                "Не удалось проверить подписку. Бот должен быть администратором канала.",
+                "Не удалось проверить канал — бот должен быть его админом.",
                 show_alert=True,
             )
         return
 
-    await callback.answer()
+    await callback.answer("Готово!")
     if isinstance(callback.message, Message):
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -1112,7 +1219,8 @@ async def cmd_ad(message: Message, state: FSMContext) -> None:
     await state.set_state(AdminStates.wait_ad_post)
     await message.answer(
         "Отправьте пост для рассылки.\n"
-        "Поддерживаются текст (с форматированием), фото, видео, документы, подписи.\n"
+        "Копируется как есть: текст, markdown/HTML, фото, видео, документы,\n"
+        "премиум-эмодзи (если у владельца бота Telegram Premium).\n"
         "Отмена — /cancel"
     )
 
@@ -1187,21 +1295,32 @@ def command_full_args(command: CommandObject) -> str:
     return (command.args or "").strip()
 
 
+_ADD_CHANNEL_HELP = (
+    "Добавление канала — любой из форматов:\n"
+    "• @channel\n"
+    "• @channel https://t.me/+XXXX\n"
+    "• https://t.me/+XXXX  (только пригласительная)\n"
+    "• -100… https://t.me/+XXXX\n"
+    "Бот должен быть админом канала.\n"
+    "Отмена — /cancel"
+)
+
+
 @admin_router.message(Command("addchannel"))
 async def cmd_addchannel(message: Message, command: CommandObject, state: FSMContext, bot: Bot) -> None:
     argument = command_full_args(command)
     if argument:
         await state.clear()
-        ok, text = await add_channel(argument, bot)
+        ok, text, pending_invite = await add_channel(argument, bot)
+        if pending_invite:
+            await state.update_data(pending_invite=pending_invite)
+            await state.set_state(AdminStates.add_channel_resolve)
+            await message.answer(text)
+            return
         await message.answer(text, reply_markup=admin_keyboard() if ok else None)
         return
     await state.set_state(AdminStates.add_channel)
-    await message.answer(
-        "Отправьте юзернейм канала (с @) или ID.\n"
-        "С invite для кнопки:\n"
-        "@channel https://t.me/+XXXX\n"
-        "Отмена — /cancel"
-    )
+    await message.answer(_ADD_CHANNEL_HELP)
 
 
 @admin_router.message(Command("setlink"))
@@ -1259,12 +1378,43 @@ async def cmd_delchannel(message: Message, command: CommandObject, state: FSMCon
 
 @admin_router.message(AdminStates.add_channel, F.text, ~F.text.startswith("/"))
 async def on_add_channel_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    ok, text = await add_channel(message.text or "", bot)
+    ok, text, pending_invite = await add_channel(message.text or "", bot)
+    if pending_invite:
+        await state.update_data(pending_invite=pending_invite)
+        await state.set_state(AdminStates.add_channel_resolve)
+        await message.answer(text)
+        return
     if ok:
         await state.clear()
         await message.answer(text, reply_markup=admin_keyboard())
         return
     await message.answer(text)
+
+
+@admin_router.message(AdminStates.add_channel_resolve)
+async def on_add_channel_resolve(message: Message, state: FSMContext, bot: Bot) -> None:
+    if message.text and message.text.startswith("/"):
+        return
+    data = await state.get_data()
+    invite = data.get("pending_invite")
+    if not invite:
+        await state.clear()
+        await message.answer("Начните заново: /addchannel")
+        return
+
+    channel = channel_from_forward(message)
+    if channel is None and message.text:
+        channel = normalize_channel(message.text.strip())
+    if channel is None:
+        await message.answer(
+            "Нужен пересланный пост из канала или числовой ID (-100…).\n"
+            "Отмена — /cancel"
+        )
+        return
+
+    ok, text = await insert_channel(channel, str(invite), bot)
+    await state.clear()
+    await message.answer(text, reply_markup=admin_keyboard() if ok else None)
 
 
 @admin_router.message(AdminStates.set_link_channel, F.text, ~F.text.startswith("/"))
@@ -1359,13 +1509,7 @@ async def admin_text(message: Message, bot: Bot, state: FSMContext) -> None:
 async def cb_admin_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminStates.add_channel)
     await callback.answer()
-    await notify(
-        callback,
-        "Отправьте юзернейм канала (с @) или ID.\n"
-        "С invite для кнопки:\n"
-        "@channel https://t.me/+XXXX\n"
-        "Отмена — /cancel",
-    )
+    await notify(callback, _ADD_CHANNEL_HELP)
 
 
 @admin_router.callback_query(F.data == "admin:link")
