@@ -83,11 +83,8 @@ def _parse_channel_list(raw: str) -> list[str]:
     return result
 
 
-MANDATORY_CHANNELS = _parse_channel_list(
-    os.getenv("MANDATORY_CHANNELS", os.getenv("MANDATORY_CHANNEL", _DEFAULT_MANDATORY))
-)
-if not MANDATORY_CHANNELS:
-    MANDATORY_CHANNELS = _parse_channel_list(_DEFAULT_MANDATORY)
+# Только @amstercheats. @amstercloud вырезан намеренно (даже если висит в env).
+MANDATORY_CHANNELS = ["@amstercheats"]
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,11 +291,16 @@ def _is_wrong_invite(url: str) -> bool:
     if lowered in _WRONG_INVITE_CODES:
         return True
     # На случай другой раскладки того же techno-smart хеша.
-    if "6p6d" in lowered and "gp6dhymmy" in lowered.replace("-", ""):
-        return True
     if "6p6d" in lowered and "ymmy" in lowered:
         return True
     return False
+
+
+# Жёстко: кнопка @amstercheats только ссылка заказчика, не techno smart.
+for _k, _v in list(BUTTON_LINKS.items()):
+    if _is_wrong_invite(_v):
+        BUTTON_LINKS.pop(_k, None)
+BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
 
 
 def member_status(member: object) -> str:
@@ -1286,6 +1288,8 @@ def gate_text(failed: list[str]) -> str:
 async def channel_list_text(rows: list[sqlite3.Row]) -> str:
     lines = ["Обязательные каналы:"]
     for channel in MANDATORY_CHANNELS:
+        if channel.lower() in _REMOVED_CHANNELS:
+            continue
         invite = await get_invite_url(channel)
         if invite:
             lines.append(f"• {channel}\n  кнопка: {invite}")
