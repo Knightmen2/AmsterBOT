@@ -260,18 +260,20 @@ def _parse_button_links(raw: str) -> dict[str, str]:
 
 
 # Ссылки на кнопках (invite/трекинг). Проверка подписки идёт по @каналу.
-# Трекинг-invite только через /setlink или env. Для публичных @ — кнопка всегда t.me/username.
+# Правильный трекинг @amstercheats (заказчик). Чужой techno-smart — вычищаем.
 _CORRECT_AMSTER_INVITE = "https://t.me/+9OI-Nlb-CpozNDg6"
+_DEFAULT_BUTTON_LINKS = f"@amstercheats={_CORRECT_AMSTER_INVITE}"
 BUTTON_LINKS: dict[str, str] = _parse_button_links(
-    os.getenv("CHANNEL_BUTTON_LINKS", "")
+    os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
 )
 
-# Опечатки в invite (I/l, P/p), которые нужно заменить на правильную ссылку.
+# Опечатки / чужие invite, которые нельзя оставлять на кнопках.
 _WRONG_INVITE_CODES = frozenset(
     {
         "9OI-NIb-CPozNDg6",
         "9OI-NIb-CpozNDg6",
         "9OI-Nlb-CPozNDg6",
+        "6P6DJz-GP6dhYmMy",  # techno smart — ошибочно проставили везде
     }
 )
 
@@ -492,21 +494,47 @@ async def init_db() -> None:
                 ("fix_amster_invite_v2", "done"),
             )
             await db.commit()
-        # v3: публичный @amstercheats больше не путаем чужим invite (кнопка вела не туда).
+        # v4: убрать techno-smart invite отовсюду, вернуть ссылку заказчика на @amstercheats.
         cursor = await db.execute(
             "SELECT value FROM meta WHERE key = ?",
-            ("fix_amster_button_v3",),
+            ("fix_amster_button_v4",),
         )
         if await cursor.fetchone() is None:
+            cursor = await db.execute(
+                "SELECT key, value FROM meta WHERE key LIKE 'invite:%'"
+            )
+            for row in await cursor.fetchall():
+                value = (row["value"] or "").strip()
+                match = INVITE_RE.fullmatch(value)
+                if match and match.group(1) in _WRONG_INVITE_CODES:
+                    await db.execute("DELETE FROM meta WHERE key = ?", (row["key"],))
+                    logger.info("Удалён чужой invite: %s", row["key"])
+            cursor = await db.execute(
+                "SELECT id, invite_url FROM channels WHERE invite_url IS NOT NULL"
+            )
+            for row in await cursor.fetchall():
+                value = (row["invite_url"] or "").strip()
+                match = INVITE_RE.fullmatch(value)
+                if match and match.group(1) in _WRONG_INVITE_CODES:
+                    await db.execute(
+                        "UPDATE channels SET invite_url = NULL WHERE id = ?",
+                        (row["id"],),
+                    )
             amster_key = _invite_meta_key("@amstercheats")
-            await db.execute("DELETE FROM meta WHERE key = ?", (amster_key,))
-            BUTTON_LINKS.pop("@amstercheats", None)
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (amster_key, _CORRECT_AMSTER_INVITE),
+            )
+            BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
             await db.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?)",
-                ("fix_amster_button_v3", "done"),
+                ("fix_amster_button_v4", "done"),
             )
             await db.commit()
-            logger.info("Сброшен invite @amstercheats — кнопка будет t.me/amstercheats")
+            logger.info(
+                "Восстановлен invite @amstercheats → %s", _CORRECT_AMSTER_INVITE
+            )
     finally:
         await db.close()
 
@@ -1276,11 +1304,11 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
     url: str | None = None
     if chat is not None:
         title = chat.title or channel
-        # Публичный @username — ВСЕГДА t.me/username (чтобы кнопка не вела в чужой канал).
-        if chat.username:
-            url = f"https://t.me/{chat.username}"
-        elif stored_invite:
+        if stored_invite:
+            # Трекинг-invite (должен вести в ЭТОТ канал — не ставь чужие ссылки).
             url = stored_invite
+        elif chat.username:
+            url = f"https://t.me/{chat.username}"
         elif chat.invite_link:
             url = chat.invite_link
         else:
@@ -1299,14 +1327,12 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
                         channel,
                         exc,
                     )
-            if url:
-                await set_invite_url(channel, url)
+            # Не пишем auto-invite в meta — иначе легко перетереть чужим каналом.
     else:
-        # Нет доступа к чату: для @ — публичная ссылка; иначе сохранённый invite.
-        if channel.startswith("@"):
-            url = f"https://t.me/{channel[1:]}"
-        else:
+        if stored_invite:
             url = stored_invite
+        elif channel.startswith("@"):
+            url = f"https://t.me/{channel[1:]}"
     title = (title or channel).strip()
     if len(title) > 60:
         title = title[:57] + "..."
