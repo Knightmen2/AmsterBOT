@@ -534,41 +534,31 @@ async def set_invite_url(channel: str, invite: str | None) -> tuple[bool, str]:
         return False, "Нужна invite-ссылка вида https://t.me/+XXXX"
 
     key = channel_norm.lower()
+    meta_key = _invite_meta_key(channel_norm)
     db = await db_conn()
     try:
-        if key in MANDATORY_LOOKUP:
-            meta_key = _invite_meta_key(channel_norm)
-            if invite_norm:
-                await db.execute(
-                    "INSERT INTO meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (meta_key, invite_norm),
-                )
-            else:
-                await db.execute("DELETE FROM meta WHERE key = ?", (meta_key,))
-            await db.commit()
-            if invite_norm:
-                BUTTON_LINKS[key] = invite_norm
-            else:
-                BUTTON_LINKS.pop(key, None)
-            text = (
-                f"Для {channel_norm} кнопка: {invite_norm}"
-                if invite_norm
-                else f"Invite-ссылка для {channel_norm} снята."
+        # Всегда в meta — чтобы кнопки работали и для каналов субадминов.
+        if invite_norm:
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (meta_key, invite_norm),
             )
-            return True, text
+            BUTTON_LINKS[key] = invite_norm
+        else:
+            await db.execute("DELETE FROM meta WHERE key = ?", (meta_key,))
+            BUTTON_LINKS.pop(key, None)
 
         cursor = await db.execute(
             "SELECT id FROM channels WHERE lower(channel_id) = ?",
             (key,),
         )
         row = await cursor.fetchone()
-        if row is None:
-            return False, "Канал не найден. Сначала добавьте его через /addchannel."
-        await db.execute(
-            "UPDATE channels SET invite_url = ? WHERE id = ?",
-            (invite_norm, row["id"]),
-        )
+        if row is not None:
+            await db.execute(
+                "UPDATE channels SET invite_url = ? WHERE id = ?",
+                (invite_norm, row["id"]),
+            )
         await db.commit()
     finally:
         await db.close()
@@ -1017,35 +1007,60 @@ async def bot_is_channel_admin(bot: Bot, channel: str) -> bool:
     return member_status(member) in {"administrator", "creator"}
 
 
-def parse_channels_list(raw: str) -> tuple[list[str], str | None]:
-    """Несколько каналов в одной строке: @a @b https://t.me/c/... или invite."""
+def parse_channels_list(
+    raw: str,
+) -> tuple[list[str], dict[str, str], str | None]:
+    """Список каналов для субадмина.
+
+    Поддержка:
+    • @channel
+    • https://t.me/channel  /  t.me/channel
+    • @channel https://t.me/+XXXX  (проверка по @, кнопка по invite)
+    • -100… https://t.me/+XXXX
+    """
     text = (raw or "").strip()
     if not text:
-        return [], "Пришлите список каналов через пробел."
+        return [], {}, "Пришлите список каналов через пробел."
+
+    tokens = re.split(r"\s+", text)
     channels: list[str] = []
+    invites: dict[str, str] = {}
     seen: set[str] = set()
-    pending_invites: list[str] = []
-    for part in re.split(r"\s+", text):
-        invite = normalize_invite_url(part)
-        if invite:
-            pending_invites.append(invite)
-            continue
-        channel = normalize_channel(part)
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if normalize_invite_url(token):
+            return (
+                [],
+                {},
+                "Одна invite-ссылка без канала не подходит.\n"
+                "Пишите так:\n"
+                "@channel\n"
+                "или @channel https://t.me/+XXXX\n"
+                "или https://t.me/channelname",
+            )
+        channel = normalize_channel(token)
         if channel is None:
-            return [], f"Не понял канал: {part}"
+            return [], {}, f"Не понял канал: {token}"
+
+        invite: str | None = None
+        if i + 1 < len(tokens):
+            maybe_invite = normalize_invite_url(tokens[i + 1])
+            if maybe_invite:
+                invite = maybe_invite
+                i += 1
+
         key = channel.lower()
         if key not in seen:
             seen.add(key)
             channels.append(channel)
-    if pending_invites and not channels:
-        return (
-            [],
-            "Только invite без @/ID: для каждого канала укажите @username или -100… "
-            "(можно: @channel https://t.me/+xxx).",
-        )
+        if invite:
+            invites[key] = invite
+        i += 1
+
     if not channels:
-        return [], "Нужен хотя бы один канал (@username или ID)."
-    return channels, None
+        return [], {}, "Нужен хотя бы один канал (@username, t.me/name или ID)."
+    return channels, invites, None
 
 
 async def touch_user(user: User | None) -> None:
@@ -2076,9 +2091,12 @@ async def _subadmin_begin_upload(
         pending_caption=caption,
     )
     await message.answer(
-        "Введите список каналов, на которые нужно подписаться для доступа к ЭТОМУ файлу.\n"
-        "Пример: @channel1 @channel2\n"
-        "Бот должен быть администратором каждого канала.\n"
+        "Введите список каналов для доступа к ЭТОМУ файлу.\n"
+        "Можно:\n"
+        "• @channel1 @channel2\n"
+        "• https://t.me/channelname\n"
+        "• @channel https://t.me/+XXXX  (кнопка = invite)\n"
+        "Бот должен быть админом каждого канала.\n"
         "Отмена — /cancel"
     )
 
@@ -2112,7 +2130,7 @@ async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: B
     await touch_user(message.from_user)
 
     if current == SubAdminStates.wait_file_channels.state:
-        channels, err = parse_channels_list(text)
+        channels, invite_map, err = parse_channels_list(text)
         if err:
             await message.answer(err)
             return
@@ -2158,6 +2176,8 @@ async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: B
                 use_global_channels=False,
                 extra_channels=channels,
             )
+            for channel, invite in invite_map.items():
+                await set_invite_url(channel, invite)
             await bump_sub_admin_files(message.from_user.id)
         except Exception as exc:
             logger.warning("Субадмин: не удалось сохранить (%s).", exc)
