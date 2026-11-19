@@ -267,16 +267,38 @@ BUTTON_LINKS: dict[str, str] = _parse_button_links(
     os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
 )
 
-# Опечатки / чужие invite, которые нельзя оставлять на кнопках.
+# Опечатки / чужие invite (сравнение без учёта регистра).
 _WRONG_INVITE_CODES = frozenset(
-    {
+    code.lower()
+    for code in (
         "9OI-NIb-CPozNDg6",
         "9OI-NIb-CpozNDg6",
         "9OI-Nlb-CPozNDg6",
-        "9OI-Nlb-CpozNDg6",  # старая трекинг-ссылка
-        "6P6DJz-GP6dhYmMy",  # techno smart — ошибочно проставили везде
-    }
+        "9OI-Nlb-CpozNDg6",
+        "6P6DJz-GP6dhYmMy",  # techno smart
+        "6P6DjZ-GP6dhYmMy",
+    )
 )
+
+
+def _invite_code(url: str) -> str | None:
+    match = INVITE_RE.fullmatch((url or "").strip())
+    return match.group(1) if match else None
+
+
+def _is_wrong_invite(url: str) -> bool:
+    code = _invite_code(url)
+    if not code:
+        return False
+    lowered = code.lower()
+    if lowered in _WRONG_INVITE_CODES:
+        return True
+    # На случай другой раскладки того же techno-smart хеша.
+    if "6p6d" in lowered and "gp6dhymmy" in lowered.replace("-", ""):
+        return True
+    if "6p6d" in lowered and "ymmy" in lowered:
+        return True
+    return False
 
 
 def member_status(member: object) -> str:
@@ -495,78 +517,98 @@ async def init_db() -> None:
                 ("fix_amster_invite_v2", "done"),
             )
             await db.commit()
-        # v5: techno-smart вон, на @amstercheats — свежая ссылка заказчика.
-        cursor = await db.execute(
-            "SELECT value FROM meta WHERE key = ?",
-            ("fix_amster_button_v5",),
-        )
-        if await cursor.fetchone() is None:
-            cursor = await db.execute(
-                "SELECT key, value FROM meta WHERE key LIKE 'invite:%'"
-            )
-            for row in await cursor.fetchall():
-                value = (row["value"] or "").strip()
-                match = INVITE_RE.fullmatch(value)
-                if match and match.group(1) in _WRONG_INVITE_CODES:
-                    await db.execute("DELETE FROM meta WHERE key = ?", (row["key"],))
-                    logger.info("Удалён чужой/устаревший invite: %s", row["key"])
-            cursor = await db.execute(
-                "SELECT id, invite_url FROM channels WHERE invite_url IS NOT NULL"
-            )
-            for row in await cursor.fetchall():
-                value = (row["invite_url"] or "").strip()
-                match = INVITE_RE.fullmatch(value)
-                if match and match.group(1) in _WRONG_INVITE_CODES:
-                    await db.execute(
-                        "UPDATE channels SET invite_url = NULL WHERE id = ?",
-                        (row["id"],),
-                    )
-            amster_key = _invite_meta_key("@amstercheats")
-            await db.execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (amster_key, _CORRECT_AMSTER_INVITE),
-            )
-            BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
-            await db.execute(
-                "INSERT INTO meta (key, value) VALUES (?, ?)",
-                ("fix_amster_button_v5", "done"),
-            )
-            await db.commit()
-            logger.info(
-                "Invite @amstercheats → %s", _CORRECT_AMSTER_INVITE
-            )
+        # Каждый старт: вычистить techno-smart и зафиксировать ссылку заказчика.
+        await repair_channel_invites(db)
     finally:
         await db.close()
 
 
+async def repair_channel_invites(db=None) -> str:
+    """Удаляет чужие invite и ставит https://t.me/+C1cA4N9MfrhmM2Zi на @amstercheats."""
+    own_conn = db is None
+    if own_conn:
+        db = await db_conn()
+    removed = 0
+    try:
+        cursor = await db.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'invite:%'"
+        )
+        for row in await cursor.fetchall():
+            value = (row["value"] or "").strip()
+            if _is_wrong_invite(value):
+                await db.execute("DELETE FROM meta WHERE key = ?", (row["key"],))
+                removed += 1
+        cursor = await db.execute(
+            "SELECT id, invite_url FROM channels WHERE invite_url IS NOT NULL"
+        )
+        for row in await cursor.fetchall():
+            value = (row["invite_url"] or "").strip()
+            if _is_wrong_invite(value):
+                await db.execute(
+                    "UPDATE channels SET invite_url = NULL WHERE id = ?",
+                    (row["id"],),
+                )
+                removed += 1
+        amster_key = _invite_meta_key("@amstercheats")
+        await db.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (amster_key, _CORRECT_AMSTER_INVITE),
+        )
+        BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
+        # Убрать устаревшие ключи из in-memory, если они битые.
+        for key, url in list(BUTTON_LINKS.items()):
+            if _is_wrong_invite(url):
+                BUTTON_LINKS.pop(key, None)
+        await db.commit()
+        logger.info(
+            "repair invites: removed=%s amstercheats=%s",
+            removed,
+            _CORRECT_AMSTER_INVITE,
+        )
+        return (
+            f"Готово. Удалено битых ссылок: {removed}.\n"
+            f"@amstercheats → {_CORRECT_AMSTER_INVITE}"
+        )
+    finally:
+        if own_conn:
+            await db.close()
+
+
 async def get_invite_url(channel: str) -> str | None:
     key = channel.lower()
+    if key == "@amstercheats":
+        return _CORRECT_AMSTER_INVITE
+
     if key in BUTTON_LINKS:
         cached = BUTTON_LINKS[key]
+        if cached and not _is_wrong_invite(cached):
+            return cached
     else:
         cached = None
     db = await db_conn()
     try:
-        # Сначала meta (обязательные и /setlink).
         cursor = await db.execute(
             "SELECT value FROM meta WHERE key = ?",
             (_invite_meta_key(channel),),
         )
         row = await cursor.fetchone()
         if row and row["value"]:
-            return str(row["value"])
-        # Затем колонка channels.invite_url.
+            value = str(row["value"])
+            if not _is_wrong_invite(value):
+                return value
         cursor = await db.execute(
             "SELECT invite_url FROM channels WHERE lower(channel_id) = ?",
             (key,),
         )
         row = await cursor.fetchone()
         if row and row["invite_url"]:
-            return str(row["invite_url"])
+            value = str(row["invite_url"])
+            if not _is_wrong_invite(value):
+                return value
     finally:
         await db.close()
-    return cached
+    return cached if cached and not _is_wrong_invite(cached) else None
 
 
 async def set_invite_url(channel: str, invite: str | None) -> tuple[bool, str]:
@@ -1627,6 +1669,17 @@ async def cmd_info(message: Message, state: FSMContext) -> None:
     await message.answer(await bot_stats_text(), reply_markup=admin_keyboard())
 
 
+@admin_router.message(Command("fixlinks"))
+async def cmd_fixlinks(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    text = await repair_channel_invites()
+    rows = await list_channels()
+    await message.answer(
+        f"{text}\n\n{await channel_list_text(rows)}",
+        reply_markup=admin_keyboard(),
+    )
+
+
 @admin_router.message(Command("setadmin"))
 async def cmd_setadmin(
     message: Message,
@@ -2262,6 +2315,7 @@ async def setup_admin_commands(bot: Bot) -> None:
         BotCommand(command="start", description="Получить файл"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="info", description="Статистика бота"),
+        BotCommand(command="fixlinks", description="Починить ссылки кнопок"),
         BotCommand(command="ad", description="Рассылка поста"),
         BotCommand(command="setadmin", description="Назначить субадмина"),
         BotCommand(command="deladmin", description="Снять субадмина"),
