@@ -49,8 +49,11 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     LinkPreviewOptions,
     Message,
+    MessageEntity,
     User,
 )
+from aiogram.utils.text_decorations import html_decoration
+import html as html_lib
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8573398640:AAELCe9o54NX2Tm0Dsewcxln2ytDhHpuA_I").strip()
 _DEFAULT_ADMINS = "7479229021,823427049"
@@ -59,8 +62,8 @@ ADMIN_IDS = frozenset(
     for part in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", _DEFAULT_ADMINS)).split(",")
     if part.strip().lstrip("-").isdigit()
 )
-_DEFAULT_MANDATORY = "@amstercheats,@amstercloud"
-_REMOVED_CHANNELS = frozenset({"@dfgames2"})
+_DEFAULT_MANDATORY = "@amstercheats"
+_REMOVED_CHANNELS = frozenset({"@dfgames2", "@amstercloud"})
 
 
 def _parse_channel_list(raw: str) -> list[str]:
@@ -1312,6 +1315,36 @@ def row_caption(row: sqlite3.Row) -> str | None:
     return text or None
 
 
+def entities_to_html(text: str, entities: list[MessageEntity] | None) -> str:
+    """Сохраняем bold/italic/ссылки/премиум-эмодзи как HTML."""
+    if not text:
+        return ""
+    if entities:
+        return html_decoration.unparse(text, entities)
+    return html_lib.escape(text)
+
+
+def html_from_message_caption(message: Message) -> str | None:
+    caption = (message.caption or "").strip()
+    if not caption:
+        return None
+    return entities_to_html(caption, list(message.caption_entities or []))
+
+
+def html_from_message_text(message: Message) -> str | None:
+    text = (message.text or "").strip()
+    if not text:
+        return None
+    return entities_to_html(text, list(message.entities or []))
+
+
+async def _send_html_text(bot: Bot, chat_id: int, text: str) -> None:
+    try:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest:
+        await bot.send_message(chat_id, text)
+
+
 async def send_stored_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
     file_type = (row["file_type"] or "document").strip()
     caption = row_caption(row)
@@ -1320,7 +1353,7 @@ async def send_stored_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
     if file_type == "text":
         if not caption:
             raise RuntimeError("Пустой текст в записи")
-        await bot.send_message(chat_id, caption)
+        await _send_html_text(bot, chat_id, caption)
         return
 
     if not file_id:
@@ -1330,17 +1363,29 @@ async def send_stored_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
     media_caption = caption if caption and len(caption) <= 1024 else None
     overflow = caption if caption and len(caption) > 1024 else None
 
-    if file_type == "photo":
-        await bot.send_photo(chat_id, file_id, caption=media_caption)
-    elif file_type == "video":
-        await bot.send_video(chat_id, file_id, caption=media_caption)
-    else:
-        await bot.send_document(chat_id, file_id, caption=media_caption)
+    async def _send_media(caption_text: str | None) -> None:
+        kwargs = {"caption": caption_text, "parse_mode": ParseMode.HTML}
+        try:
+            if file_type == "photo":
+                await bot.send_photo(chat_id, file_id, **kwargs)
+            elif file_type == "video":
+                await bot.send_video(chat_id, file_id, **kwargs)
+            else:
+                await bot.send_document(chat_id, file_id, **kwargs)
+        except TelegramBadRequest:
+            if file_type == "photo":
+                await bot.send_photo(chat_id, file_id, caption=caption_text)
+            elif file_type == "video":
+                await bot.send_video(chat_id, file_id, caption=caption_text)
+            else:
+                await bot.send_document(chat_id, file_id, caption=caption_text)
+
+    await _send_media(media_caption)
 
     if overflow:
-        await bot.send_message(chat_id, overflow)
+        await _send_html_text(bot, chat_id, overflow)
     elif caption and media_caption is None:
-        await bot.send_message(chat_id, caption)
+        await _send_html_text(bot, chat_id, caption)
 
 
 async def reply_with_share_link(message: Message, bot: Bot, file_hash: str, kind: str) -> None:
@@ -1854,7 +1899,7 @@ async def admin_file(message: Message, bot: Bot, state: FSMContext) -> None:
     if extracted is None:
         return
     file_id, file_type = extracted
-    caption = (message.caption or "").strip() or None
+    caption = html_from_message_caption(message)
     try:
         file_hash = await save_content(file_type, file_id=file_id, caption=caption)
         await reply_with_share_link(message, bot, file_hash, "file")
@@ -1875,7 +1920,7 @@ async def admin_text(message: Message, bot: Bot, state: FSMContext) -> None:
     current = await state.get_state()
     if current is not None:
         return
-    text = (message.text or "").strip()
+    text = html_from_message_text(message)
     if not text:
         return
     try:
@@ -2047,7 +2092,7 @@ async def sub_admin_file(message: Message, state: FSMContext) -> None:
     if extracted is None:
         return
     file_id, file_type = extracted
-    caption = (message.caption or "").strip() or None
+    caption = html_from_message_caption(message)
     await touch_user(message.from_user)
     await _subadmin_begin_upload(
         message,
@@ -2133,12 +2178,15 @@ async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: B
 
     if current is not None:
         return
+    html_text = html_from_message_text(message)
+    if not html_text:
+        return
     await _subadmin_begin_upload(
         message,
         state,
         file_type="text",
         file_id=None,
-        caption=text,
+        caption=html_text,
     )
 
 
