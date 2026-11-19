@@ -260,10 +260,10 @@ def _parse_button_links(raw: str) -> dict[str, str]:
 
 
 # Ссылки на кнопках (invite/трекинг). Проверка подписки идёт по @каналу.
+# Трекинг-invite только через /setlink или env. Для публичных @ — кнопка всегда t.me/username.
 _CORRECT_AMSTER_INVITE = "https://t.me/+9OI-Nlb-CpozNDg6"
-_DEFAULT_BUTTON_LINKS = f"@amstercheats={_CORRECT_AMSTER_INVITE}"
 BUTTON_LINKS: dict[str, str] = _parse_button_links(
-    os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
+    os.getenv("CHANNEL_BUTTON_LINKS", "")
 )
 
 # Опечатки в invite (I/l, P/p), которые нужно заменить на правильную ссылку.
@@ -492,6 +492,21 @@ async def init_db() -> None:
                 ("fix_amster_invite_v2", "done"),
             )
             await db.commit()
+        # v3: публичный @amstercheats больше не путаем чужим invite (кнопка вела не туда).
+        cursor = await db.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("fix_amster_button_v3",),
+        )
+        if await cursor.fetchone() is None:
+            amster_key = _invite_meta_key("@amstercheats")
+            await db.execute("DELETE FROM meta WHERE key = ?", (amster_key,))
+            BUTTON_LINKS.pop("@amstercheats", None)
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?)",
+                ("fix_amster_button_v3", "done"),
+            )
+            await db.commit()
+            logger.info("Сброшен invite @amstercheats — кнопка будет t.me/amstercheats")
     finally:
         await db.close()
 
@@ -1248,8 +1263,7 @@ def delete_keyboard(rows: list[sqlite3.Row]) -> InlineKeyboardMarkup:
 
 async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
     title = channel
-    # Приоритет: invite/трекинг-ссылка (как хочет заказчик).
-    url: str | None = await get_invite_url(channel)
+    stored_invite = await get_invite_url(channel)
     chat = None
     try:
         chat = await bot.get_chat(chat_target(channel))
@@ -1259,34 +1273,40 @@ async def channel_button(bot: Bot, channel: str) -> InlineKeyboardButton:
             channel,
             exc,
         )
+    url: str | None = None
     if chat is not None:
         title = chat.title or channel
-        if url is None:
-            if chat.username:
-                url = f"https://t.me/{chat.username}"
-            elif chat.invite_link:
-                url = chat.invite_link
-            else:
-                # Приватный канал без сохранённой ссылки — создаём invite ботом.
+        # Публичный @username — ВСЕГДА t.me/username (чтобы кнопка не вела в чужой канал).
+        if chat.username:
+            url = f"https://t.me/{chat.username}"
+        elif stored_invite:
+            url = stored_invite
+        elif chat.invite_link:
+            url = chat.invite_link
+        else:
+            try:
+                url = await bot.export_chat_invite_link(chat.id)
+            except Exception:
                 try:
-                    url = await bot.export_chat_invite_link(chat.id)
-                except Exception:
-                    try:
-                        created = await bot.create_chat_invite_link(
-                            chat_id=chat.id,
-                            name="amsterbot",
-                        )
-                        url = created.invite_link
-                    except Exception as exc:
-                        logger.warning(
-                            "Не удалось создать invite для %s (%s).",
-                            channel,
-                            exc,
-                        )
-                if url:
-                    await set_invite_url(channel, url)
-    if url is None and channel.startswith("@"):
-        url = f"https://t.me/{channel[1:]}"
+                    created = await bot.create_chat_invite_link(
+                        chat_id=chat.id,
+                        name="amsterbot",
+                    )
+                    url = created.invite_link
+                except Exception as exc:
+                    logger.warning(
+                        "Не удалось создать invite для %s (%s).",
+                        channel,
+                        exc,
+                    )
+            if url:
+                await set_invite_url(channel, url)
+    else:
+        # Нет доступа к чату: для @ — публичная ссылка; иначе сохранённый invite.
+        if channel.startswith("@"):
+            url = f"https://t.me/{channel[1:]}"
+        else:
+            url = stored_invite
     title = (title or channel).strip()
     if len(title) > 60:
         title = title[:57] + "..."
