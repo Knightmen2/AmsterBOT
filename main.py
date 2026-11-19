@@ -260,8 +260,8 @@ def _parse_button_links(raw: str) -> dict[str, str]:
 
 
 # Ссылки на кнопках (invite/трекинг). Проверка подписки идёт по @каналу.
-# Правильный трекинг @amstercheats (заказчик). Чужой techno-smart — вычищаем.
-_CORRECT_AMSTER_INVITE = "https://t.me/+9OI-Nlb-CpozNDg6"
+# Актуальный трекинг @amstercheats от заказчика (23:06).
+_CORRECT_AMSTER_INVITE = "https://t.me/+C1cA4N9MfrhmM2Zi"
 _DEFAULT_BUTTON_LINKS = f"@amstercheats={_CORRECT_AMSTER_INVITE}"
 BUTTON_LINKS: dict[str, str] = _parse_button_links(
     os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
@@ -273,6 +273,7 @@ _WRONG_INVITE_CODES = frozenset(
         "9OI-NIb-CPozNDg6",
         "9OI-NIb-CpozNDg6",
         "9OI-Nlb-CPozNDg6",
+        "9OI-Nlb-CpozNDg6",  # старая трекинг-ссылка
         "6P6DJz-GP6dhYmMy",  # techno smart — ошибочно проставили везде
     }
 )
@@ -494,10 +495,10 @@ async def init_db() -> None:
                 ("fix_amster_invite_v2", "done"),
             )
             await db.commit()
-        # v4: убрать techno-smart invite отовсюду, вернуть ссылку заказчика на @amstercheats.
+        # v5: techno-smart вон, на @amstercheats — свежая ссылка заказчика.
         cursor = await db.execute(
             "SELECT value FROM meta WHERE key = ?",
-            ("fix_amster_button_v4",),
+            ("fix_amster_button_v5",),
         )
         if await cursor.fetchone() is None:
             cursor = await db.execute(
@@ -508,7 +509,7 @@ async def init_db() -> None:
                 match = INVITE_RE.fullmatch(value)
                 if match and match.group(1) in _WRONG_INVITE_CODES:
                     await db.execute("DELETE FROM meta WHERE key = ?", (row["key"],))
-                    logger.info("Удалён чужой invite: %s", row["key"])
+                    logger.info("Удалён чужой/устаревший invite: %s", row["key"])
             cursor = await db.execute(
                 "SELECT id, invite_url FROM channels WHERE invite_url IS NOT NULL"
             )
@@ -529,11 +530,11 @@ async def init_db() -> None:
             BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
             await db.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?)",
-                ("fix_amster_button_v4", "done"),
+                ("fix_amster_button_v5", "done"),
             )
             await db.commit()
             logger.info(
-                "Восстановлен invite @amstercheats → %s", _CORRECT_AMSTER_INVITE
+                "Invite @amstercheats → %s", _CORRECT_AMSTER_INVITE
             )
     finally:
         await db.close()
