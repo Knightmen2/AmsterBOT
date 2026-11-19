@@ -123,6 +123,7 @@ logger = logging.getLogger("file_bot")
 
 router = Router(name="users")
 admin_router = Router(name="admin")
+subadmin_router = Router(name="subadmin")
 
 
 class AdminFilter(BaseFilter):
@@ -131,8 +132,17 @@ class AdminFilter(BaseFilter):
         return user is not None and user.id in ADMIN_IDS
 
 
+class SubAdminFilter(BaseFilter):
+    async def __call__(self, event: Message | CallbackQuery) -> bool:
+        user = event.from_user
+        if user is None or user.id in ADMIN_IDS:
+            return False
+        return await is_sub_admin(user.id)
+
+
 admin_router.message.filter(AdminFilter(), F.chat.type == ChatType.PRIVATE)
 admin_router.callback_query.filter(AdminFilter())
+subadmin_router.message.filter(SubAdminFilter(), F.chat.type == ChatType.PRIVATE)
 
 
 class AdminStates(StatesGroup):
@@ -142,6 +152,10 @@ class AdminStates(StatesGroup):
     set_link_channel = State()
     set_link_url = State()
     wait_ad_post = State()
+
+
+class SubAdminStates(StatesGroup):
+    wait_file_channels = State()
 
 
 def chat_target(channel: str) -> int | str:
@@ -383,7 +397,38 @@ async def init_db() -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sub_admins (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                file_limit INTEGER NOT NULL DEFAULT 0,
+                files_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_channels (
+                file_hash TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                PRIMARY KEY (file_hash, channel_id)
+            )
+            """
+        )
         await db.commit()
+        try:
+            await db.execute("ALTER TABLE files ADD COLUMN owner_id INTEGER")
+            await db.commit()
+        except _alter_errors:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE files ADD COLUMN use_global_channels INTEGER NOT NULL DEFAULT 1"
+            )
+            await db.commit()
+        except _alter_errors:
+            pass
         # Одноразовая очистка тестовых загрузок админов (wipe_files_v1).
         cursor = await db.execute(
             "SELECT value FROM meta WHERE key = ?",
@@ -699,6 +744,9 @@ async def save_content(
     *,
     file_id: str | None = None,
     caption: str | None = None,
+    owner_id: int | None = None,
+    use_global_channels: bool = True,
+    extra_channels: list[str] | None = None,
 ) -> str:
     caption_value = (caption or "").strip() or None
     file_value = (file_id or "").strip() or None
@@ -716,11 +764,29 @@ async def save_content(
             try:
                 await db.execute(
                     """
-                    INSERT INTO files (file_id, file_hash, file_type, caption)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO files (
+                        file_id, file_hash, file_type, caption,
+                        owner_id, use_global_channels
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (file_value, file_hash, file_type, caption_value),
+                    (
+                        file_value,
+                        file_hash,
+                        file_type,
+                        caption_value,
+                        owner_id,
+                        1 if use_global_channels else 0,
+                    ),
                 )
+                for channel in extra_channels or []:
+                    await db.execute(
+                        """
+                        INSERT OR IGNORE INTO file_channels (file_hash, channel_id)
+                        VALUES (?, ?)
+                        """,
+                        (file_hash, channel),
+                    )
                 await db.commit()
                 return file_hash
             except sqlite3.IntegrityError:
@@ -740,12 +806,243 @@ async def get_file(file_hash: str) -> sqlite3.Row | None:
     db = await db_conn()
     try:
         cursor = await db.execute(
-            "SELECT file_id, file_type, caption FROM files WHERE file_hash = ?",
+            """
+            SELECT file_id, file_type, caption, owner_id, use_global_channels
+            FROM files WHERE file_hash = ?
+            """,
             (file_hash,),
         )
         return await cursor.fetchone()
     finally:
         await db.close()
+
+
+async def get_file_channels(file_hash: str) -> list[str]:
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT channel_id FROM file_channels WHERE file_hash = ? ORDER BY channel_id",
+            (file_hash,),
+        )
+        rows = await cursor.fetchall()
+        return [(row["channel_id"] or "").strip() for row in rows if row["channel_id"]]
+    finally:
+        await db.close()
+
+
+async def channels_for_file(file_hash: str) -> list[str]:
+    """Обязательные + либо глобальные, либо каналы конкретного файла (субадмин)."""
+    row = await get_file(file_hash)
+    if row is None:
+        return await required_channels()
+    try:
+        use_global = int(row["use_global_channels"] if row["use_global_channels"] is not None else 1)
+    except (KeyError, IndexError, TypeError, ValueError):
+        use_global = 1
+
+    channels = list(MANDATORY_CHANNELS)
+    seen = set(MANDATORY_LOOKUP)
+    if use_global:
+        for channel in await required_channels():
+            key = channel.lower()
+            if key not in seen:
+                seen.add(key)
+                channels.append(channel)
+    else:
+        for channel in await get_file_channels(file_hash):
+            key = channel.lower()
+            if channel and key not in seen:
+                seen.add(key)
+                channels.append(channel)
+    return channels
+
+
+async def is_sub_admin(user_id: int) -> bool:
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        )
+        return await cursor.fetchone() is not None
+    finally:
+        await db.close()
+
+
+async def get_sub_admin(user_id: int) -> sqlite3.Row | None:
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id, username, file_limit, files_count FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        )
+        return await cursor.fetchone()
+    finally:
+        await db.close()
+
+
+async def find_user_id_by_username(username: str) -> int | None:
+    name = username.lstrip("@").strip().lower()
+    if not name:
+        return None
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE lower(username) = ?",
+            (name,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            return int(row["user_id"])
+        cursor = await db.execute(
+            "SELECT user_id FROM sub_admins WHERE lower(username) = ?",
+            (name,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            return int(row["user_id"])
+    finally:
+        await db.close()
+    return None
+
+
+async def resolve_user_ref(message: Message, raw: str) -> tuple[int | None, str]:
+    """@username / id / reply → user_id. Юзер должен хотя бы раз написать боту."""
+    if message.reply_to_message and message.reply_to_message.from_user:
+        u = message.reply_to_message.from_user
+        return u.id, (u.username or str(u.id))
+
+    text = (raw or "").strip()
+    if not text:
+        return None, "Укажите @username, числовой ID или ответьте реплаем на сообщение пользователя."
+
+    if text.lstrip("-").isdigit():
+        return int(text), text
+
+    if text.startswith("@") or USERNAME_RE.fullmatch(text):
+        uid = await find_user_id_by_username(text)
+        if uid is None:
+            return (
+                None,
+                f"Не знаю {text}: пусть человек сначала нажмёт /start у бота, "
+                "либо укажите числовой ID / сделайте реплай.",
+            )
+        return uid, text if text.startswith("@") else f"@{text}"
+
+    return None, "Формат: @username или числовой ID (или реплай)."
+
+
+async def upsert_sub_admin(user_id: int, username: str | None = None) -> None:
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        )
+        if await cursor.fetchone() is None:
+            await db.execute(
+                """
+                INSERT INTO sub_admins (user_id, username, file_limit, files_count)
+                VALUES (?, ?, 0, 0)
+                """,
+                (user_id, username),
+            )
+        elif username:
+            await db.execute(
+                "UPDATE sub_admins SET username = ? WHERE user_id = ?",
+                (username, user_id),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def delete_sub_admin(user_id: int) -> bool:
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        )
+        if await cursor.fetchone() is None:
+            return False
+        await db.execute("DELETE FROM sub_admins WHERE user_id = ?", (user_id,))
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def set_sub_admin_limit(user_id: int, limit: int) -> bool:
+    db = await db_conn()
+    try:
+        cursor = await db.execute(
+            "SELECT user_id FROM sub_admins WHERE user_id = ?",
+            (user_id,),
+        )
+        if await cursor.fetchone() is None:
+            return False
+        await db.execute(
+            "UPDATE sub_admins SET file_limit = ? WHERE user_id = ?",
+            (limit, user_id),
+        )
+        await db.commit()
+        return True
+    finally:
+        await db.close()
+
+
+async def bump_sub_admin_files(user_id: int) -> None:
+    db = await db_conn()
+    try:
+        await db.execute(
+            "UPDATE sub_admins SET files_count = files_count + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def bot_is_channel_admin(bot: Bot, channel: str) -> bool:
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(chat_id=chat_target(channel), user_id=me.id)
+    except Exception as exc:
+        logger.warning("Бот не видит канал %s (%s).", channel, exc)
+        return False
+    return member_status(member) in {"administrator", "creator"}
+
+
+def parse_channels_list(raw: str) -> tuple[list[str], str | None]:
+    """Несколько каналов в одной строке: @a @b https://t.me/c/... или invite."""
+    text = (raw or "").strip()
+    if not text:
+        return [], "Пришлите список каналов через пробел."
+    channels: list[str] = []
+    seen: set[str] = set()
+    pending_invites: list[str] = []
+    for part in re.split(r"\s+", text):
+        invite = normalize_invite_url(part)
+        if invite:
+            pending_invites.append(invite)
+            continue
+        channel = normalize_channel(part)
+        if channel is None:
+            return [], f"Не понял канал: {part}"
+        key = channel.lower()
+        if key not in seen:
+            seen.add(key)
+            channels.append(channel)
+    if pending_invites and not channels:
+        return (
+            [],
+            "Только invite без @/ID: для каждого канала укажите @username или -100… "
+            "(можно: @channel https://t.me/+xxx).",
+        )
+    if not channels:
+        return [], "Нужен хотя бы один канал (@username или ID)."
+    return channels, None
 
 
 async def touch_user(user: User | None) -> None:
@@ -847,8 +1144,16 @@ async def is_subscribed(bot: Bot, user_id: int, channel: str) -> bool | None:
     return member_status(member) in ALLOWED_MEMBER_STATUSES
 
 
-async def check_subscriptions(bot: Bot, user_id: int) -> tuple[list[str], list[str]]:
-    channels = await required_channels()
+async def check_subscriptions(
+    bot: Bot,
+    user_id: int,
+    file_hash: str | None = None,
+) -> tuple[list[str], list[str]]:
+    channels = (
+        await channels_for_file(file_hash)
+        if file_hash
+        else await required_channels()
+    )
     results = await asyncio.gather(
         *(is_subscribed(bot, user_id, channel) for channel in channels)
     )
@@ -1068,7 +1373,7 @@ async def notify(event: Message | CallbackQuery, text: str, **kwargs: object) ->
 
 
 async def deliver_or_gate(bot: Bot, chat_id: int, user_id: int, file_hash: str, row: sqlite3.Row) -> tuple[str, InlineKeyboardMarkup] | None:
-    missing, failed = await check_subscriptions(bot, user_id)
+    missing, failed = await check_subscriptions(bot, user_id, file_hash)
     if not missing and not failed:
         await send_stored_content(bot, chat_id, row)
         return None
@@ -1135,7 +1440,7 @@ async def cb_check_sub(callback: CallbackQuery, bot: Bot) -> None:
 
     await touch_user(callback.from_user)
     try:
-        missing, failed = await check_subscriptions(bot, callback.from_user.id)
+        missing, failed = await check_subscriptions(bot, callback.from_user.id, file_hash)
     except Exception as exc:
         logger.warning("Ошибка проверки подписки (%s).", exc)
         await callback.answer("Ошибка проверки. Попробуйте ещё раз.", show_alert=True)
@@ -1203,7 +1508,8 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
         "• Каналы: проверка по @, кнопка может быть invite (t.me/+…)\n"
         "• /setlink @channel https://t.me/+XXXX — ссылка в кнопке\n"
         "• /info — статистика\n"
-        "• /ad — рассылка поста всем пользователям",
+        "• /ad — рассылка поста всем пользователям\n"
+        "• /setadmin /deladmin /setlimit — субадмины",
         reply_markup=admin_keyboard(),
     )
 
@@ -1212,6 +1518,83 @@ async def cmd_admin(message: Message, state: FSMContext) -> None:
 async def cmd_info(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(await bot_stats_text(), reply_markup=admin_keyboard())
+
+
+@admin_router.message(Command("setadmin"))
+async def cmd_setadmin(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    await state.clear()
+    uid, label = await resolve_user_ref(message, command_full_args(command))
+    if uid is None:
+        await message.answer(
+            label + "\nПример: /setadmin @user или /setadmin 123456\n"
+            "Либо реплай на сообщение пользователя + /setadmin"
+        )
+        return
+    if uid in ADMIN_IDS:
+        await message.answer("Это уже главный админ.")
+        return
+    uname = label.lstrip("@") if label.startswith("@") else None
+    await upsert_sub_admin(uid, uname)
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Кабинет субадмина"),
+                BotCommand(command="cancel", description="Отмена"),
+            ],
+            scope=BotCommandScopeChat(chat_id=uid),
+        )
+    except Exception as exc:
+        logger.warning("Команды субадмина %s: %s", uid, exc)
+    await message.answer(
+        f"Субадмин назначен: {label} (id {uid}).\n"
+        "Лимит файлов: без лимита (0). Задать: /setlimit @user 50",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@admin_router.message(Command("deladmin"))
+async def cmd_deladmin(message: Message, command: CommandObject, state: FSMContext) -> None:
+    await state.clear()
+    uid, label = await resolve_user_ref(message, command_full_args(command))
+    if uid is None:
+        await message.answer(label + "\nПример: /deladmin @user")
+        return
+    if await delete_sub_admin(uid):
+        await message.answer(f"Субадмин снят: {label}", reply_markup=admin_keyboard())
+    else:
+        await message.answer("Этот пользователь не субадмин.")
+
+
+@admin_router.message(Command("setlimit"))
+async def cmd_setlimit(message: Message, command: CommandObject, state: FSMContext) -> None:
+    await state.clear()
+    args = command_full_args(command).split()
+    if len(args) < 2:
+        await message.answer("Формат: /setlimit @user 50\n0 = без лимита")
+        return
+    limit_raw = args[-1]
+    if not limit_raw.isdigit():
+        await message.answer("Лимит должен быть числом (0 = без лимита).")
+        return
+    limit = int(limit_raw)
+    uid, label = await resolve_user_ref(message, " ".join(args[:-1]))
+    if uid is None:
+        await message.answer(label)
+        return
+    if not await set_sub_admin_limit(uid, limit):
+        await message.answer("Сначала назначьте субадмина: /setadmin …")
+        return
+    text = (
+        f"Лимит для {label}: без ограничений"
+        if limit == 0
+        else f"Лимит для {label}: {limit} файлов"
+    )
+    await message.answer(text, reply_markup=admin_keyboard())
 
 
 @admin_router.message(Command("ad"))
@@ -1571,12 +1954,203 @@ async def cb_delete_channel(callback: CallbackQuery, state: FSMContext) -> None:
     await notify(callback, text, reply_markup=admin_keyboard())
 
 
+@subadmin_router.message(Command("cancel"))
+async def sub_cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Отменено. Пришлите файл или текст заново.")
+
+
+@subadmin_router.message(CommandStart())
+async def sub_cmd_start(
+    message: Message,
+    command: CommandObject,
+    state: FSMContext,
+    bot: Bot,
+) -> None:
+    await state.clear()
+    await touch_user(message.from_user)
+    payload = ""
+    if command.args:
+        payload = command.args.strip().split(maxsplit=1)[0]
+    if payload:
+        if not HASH_RE.fullmatch(payload):
+            await message.answer("Файл не найден")
+            return
+        row = await get_file(payload)
+        if row is None:
+            await message.answer("Файл не найден")
+            return
+        try:
+            gate = await deliver_or_gate(
+                bot, message.chat.id, message.from_user.id, payload, row
+            )
+        except Exception as exc:
+            logger.warning("Субадмин start deliver (%s).", exc)
+            await message.answer("Не удалось отправить. Попробуйте позже.")
+            return
+        if gate is not None:
+            text, keyboard = gate
+            await message.answer(text, reply_markup=keyboard)
+        return
+
+    row = await get_sub_admin(message.from_user.id)
+    limit = int(row["file_limit"]) if row else 0
+    used = int(row["files_count"]) if row else 0
+    limit_text = "без лимита" if limit == 0 else f"{used}/{limit}"
+    await message.answer(
+        "Вы субадмин.\n"
+        f"Загружено файлов: {limit_text}\n\n"
+        "Пришлите файл/фото/видео/текст — затем список каналов для ЭТОГО файла.\n"
+        "Обязательные каналы владельца бота подключатся автоматически."
+    )
+
+
+async def _subadmin_begin_upload(
+    message: Message,
+    state: FSMContext,
+    *,
+    file_type: str,
+    file_id: str | None,
+    caption: str | None,
+) -> None:
+    row = await get_sub_admin(message.from_user.id)
+    if row is None:
+        await message.answer("Нет прав субадмина.")
+        return
+    limit = int(row["file_limit"] or 0)
+    used = int(row["files_count"] or 0)
+    if limit > 0 and used >= limit:
+        await message.answer(
+            f"Лимит исчерпан ({used}/{limit}). Обратитесь к главному админу."
+        )
+        return
+    await state.set_state(SubAdminStates.wait_file_channels)
+    await state.update_data(
+        pending_file_type=file_type,
+        pending_file_id=file_id,
+        pending_caption=caption,
+    )
+    await message.answer(
+        "Введите список каналов, на которые нужно подписаться для доступа к ЭТОМУ файлу.\n"
+        "Пример: @channel1 @channel2\n"
+        "Бот должен быть администратором каждого канала.\n"
+        "Отмена — /cancel"
+    )
+
+
+@subadmin_router.message(F.content_type.in_({"document", "video", "photo"}))
+async def sub_admin_file(message: Message, state: FSMContext) -> None:
+    current = await state.get_state()
+    if current is not None:
+        return
+    extracted = extract_file(message)
+    if extracted is None:
+        return
+    file_id, file_type = extracted
+    caption = (message.caption or "").strip() or None
+    await touch_user(message.from_user)
+    await _subadmin_begin_upload(
+        message,
+        state,
+        file_type=file_type,
+        file_id=file_id,
+        caption=caption,
+    )
+
+
+@subadmin_router.message(F.text, ~F.text.startswith("/"))
+async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: Bot) -> None:
+    current = await state.get_state()
+    text = (message.text or "").strip()
+    if not text:
+        return
+    await touch_user(message.from_user)
+
+    if current == SubAdminStates.wait_file_channels.state:
+        channels, err = parse_channels_list(text)
+        if err:
+            await message.answer(err)
+            return
+        bad: list[str] = []
+        for channel in channels:
+            if not await bot_is_channel_admin(bot, channel):
+                bad.append(channel)
+        if bad:
+            await message.answer(
+                "Бот не администратор во всех каналах:\n"
+                + "\n".join(f"• {c}" for c in bad)
+                + "\n\nДобавьте бота админом и пришлите список ещё раз."
+            )
+            return
+
+        data = await state.get_data()
+        file_type = str(data.get("pending_file_type") or "")
+        file_id = data.get("pending_file_id")
+        caption = data.get("pending_caption")
+        if not file_type:
+            await state.clear()
+            await message.answer("Сессия сброшена. Пришлите файл заново.")
+            return
+
+        row = await get_sub_admin(message.from_user.id)
+        if row is None:
+            await state.clear()
+            await message.answer("Нет прав субадмина.")
+            return
+        limit = int(row["file_limit"] or 0)
+        used = int(row["files_count"] or 0)
+        if limit > 0 and used >= limit:
+            await state.clear()
+            await message.answer(f"Лимит исчерпан ({used}/{limit}).")
+            return
+
+        try:
+            file_hash = await save_content(
+                file_type,
+                file_id=str(file_id) if file_id else None,
+                caption=str(caption) if caption else None,
+                owner_id=message.from_user.id,
+                use_global_channels=False,
+                extra_channels=channels,
+            )
+            await bump_sub_admin_files(message.from_user.id)
+        except Exception as exc:
+            logger.warning("Субадмин: не удалось сохранить (%s).", exc)
+            await message.answer("Не удалось создать ссылку. Попробуйте ещё раз.")
+            return
+
+        await state.clear()
+        kind = "text" if file_type == "text" else "file"
+        await reply_with_share_link(message, bot, file_hash, kind)
+        left = ""
+        if limit > 0:
+            left = f"\nЛимит: {used + 1}/{limit}"
+        await message.answer(
+            "Файл сохранён. Для получения нужны ваши каналы + обязательные каналы бота."
+            + left
+        )
+        return
+
+    if current is not None:
+        return
+    await _subadmin_begin_upload(
+        message,
+        state,
+        file_type="text",
+        file_id=None,
+        caption=text,
+    )
+
+
 async def setup_admin_commands(bot: Bot) -> None:
     commands = [
         BotCommand(command="start", description="Получить файл"),
         BotCommand(command="admin", description="Админ-панель"),
         BotCommand(command="info", description="Статистика бота"),
         BotCommand(command="ad", description="Рассылка поста"),
+        BotCommand(command="setadmin", description="Назначить субадмина"),
+        BotCommand(command="deladmin", description="Снять субадмина"),
+        BotCommand(command="setlimit", description="Лимит файлов субадмина"),
         BotCommand(command="addchannel", description="Добавить канал"),
         BotCommand(command="setlink", description="Ссылка кнопки канала"),
         BotCommand(command="delchannel", description="Удалить канал"),
@@ -1590,6 +2164,29 @@ async def setup_admin_commands(bot: Bot) -> None:
             logger.warning(
                 "Предупреждение: не удалось установить команды админа %s (%s).",
                 admin_id,
+                exc,
+            )
+
+    sub_commands = [
+        BotCommand(command="start", description="Кабинет субадмина"),
+        BotCommand(command="cancel", description="Отмена"),
+    ]
+    db = await db_conn()
+    try:
+        cursor = await db.execute("SELECT user_id FROM sub_admins")
+        rows = await cursor.fetchall()
+    finally:
+        await db.close()
+    for row in rows:
+        try:
+            await bot.set_my_commands(
+                sub_commands,
+                scope=BotCommandScopeChat(chat_id=int(row["user_id"])),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось установить команды субадмина %s (%s).",
+                row["user_id"],
                 exc,
             )
 
@@ -1649,6 +2246,7 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(admin_router)
+    dp.include_router(subadmin_router)
     dp.include_router(router)
     health_task = asyncio.create_task(keep_health_server())
     try:
