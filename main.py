@@ -18,6 +18,7 @@ Render (Web Service):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -459,6 +460,16 @@ async def init_db() -> None:
             await db.commit()
         except _alter_errors:
             pass
+        for col_sql in (
+            "ALTER TABLE files ADD COLUMN source_chat_id INTEGER",
+            "ALTER TABLE files ADD COLUMN source_message_id INTEGER",
+            "ALTER TABLE files ADD COLUMN caption_html TEXT",
+        ):
+            try:
+                await db.execute(col_sql)
+                await db.commit()
+            except _alter_errors:
+                pass
         # Одноразовая очистка тестовых загрузок админов (wipe_files_v1).
         cursor = await db.execute(
             "SELECT value FROM meta WHERE key = ?",
@@ -825,14 +836,18 @@ async def save_content(
     *,
     file_id: str | None = None,
     caption: str | None = None,
+    caption_html: str | None = None,
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
     owner_id: int | None = None,
     use_global_channels: bool = True,
     extra_channels: list[str] | None = None,
 ) -> str:
     caption_value = (caption or "").strip() or None
+    caption_html_value = (caption_html or "").strip() or None
     file_value = (file_id or "").strip() or None
     if file_type == "text":
-        if not caption_value:
+        if not caption_value and not caption_html_value:
             raise ValueError("Пустой текст")
         file_value = None
     elif not file_value:
@@ -846,16 +861,20 @@ async def save_content(
                 await db.execute(
                     """
                     INSERT INTO files (
-                        file_id, file_hash, file_type, caption,
+                        file_id, file_hash, file_type, caption, caption_html,
+                        source_chat_id, source_message_id,
                         owner_id, use_global_channels
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         file_value,
                         file_hash,
                         file_type,
                         caption_value,
+                        caption_html_value,
+                        source_chat_id,
+                        source_message_id,
                         owner_id,
                         1 if use_global_channels else 0,
                     ),
@@ -888,7 +907,9 @@ async def get_file(file_hash: str) -> sqlite3.Row | None:
     try:
         cursor = await db.execute(
             """
-            SELECT file_id, file_type, caption, owner_id, use_global_channels
+            SELECT file_id, file_type, caption, caption_html,
+                   source_chat_id, source_message_id,
+                   owner_id, use_global_channels
             FROM files WHERE file_hash = ?
             """,
             (file_hash,),
@@ -1413,14 +1434,18 @@ def extract_file(message: Message) -> tuple[str, str] | None:
 
 
 def row_caption(row: sqlite3.Row) -> str | None:
-    try:
-        value = row["caption"]
-    except (KeyError, IndexError):
-        return None
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+    """HTML-подпись предпочтительнее plain."""
+    for key in ("caption_html", "caption"):
+        try:
+            value = row[key]
+        except (KeyError, IndexError):
+            continue
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
 
 
 def entities_to_html(text: str, entities: list[MessageEntity] | None) -> str:
@@ -1446,6 +1471,16 @@ def html_from_message_text(message: Message) -> str | None:
     return entities_to_html(text, list(message.entities or []))
 
 
+def plain_from_message_caption(message: Message) -> str | None:
+    caption = (message.caption or "").strip()
+    return caption or None
+
+
+def plain_from_message_text(message: Message) -> str | None:
+    text = (message.text or "").strip()
+    return text or None
+
+
 async def _send_html_text(bot: Bot, chat_id: int, text: str) -> None:
     try:
         await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
@@ -1457,6 +1492,29 @@ async def send_stored_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
     file_type = (row["file_type"] or "document").strip()
     caption = row_caption(row)
     file_id = (row["file_id"] or "").strip()
+
+    # Как /ad: копируем исходное сообщение целиком (HTML + премиум-эмодзи).
+    try:
+        source_chat_id = row["source_chat_id"]
+        source_message_id = row["source_message_id"]
+    except (KeyError, IndexError):
+        source_chat_id = None
+        source_message_id = None
+    if source_chat_id and source_message_id:
+        try:
+            await bot.copy_message(
+                chat_id=chat_id,
+                from_chat_id=int(source_chat_id),
+                message_id=int(source_message_id),
+            )
+            return
+        except Exception as exc:
+            logger.warning(
+                "copy_message не удался (chat=%s msg=%s): %s — fallback",
+                source_chat_id,
+                source_message_id,
+                exc,
+            )
 
     if file_type == "text":
         if not caption:
@@ -2018,9 +2076,18 @@ async def admin_file(message: Message, bot: Bot, state: FSMContext) -> None:
     if extracted is None:
         return
     file_id, file_type = extracted
-    caption = html_from_message_caption(message)
+    caption_plain = plain_from_message_caption(message)
+    caption_html = html_from_message_caption(message)
     try:
-        file_hash = await save_content(file_type, file_id=file_id, caption=caption)
+        file_hash = await save_content(
+            file_type,
+            file_id=file_id,
+            caption=caption_plain,
+            caption_html=caption_html,
+            source_chat_id=message.chat.id,
+            source_message_id=message.message_id,
+            owner_id=message.from_user.id if message.from_user else None,
+        )
         await reply_with_share_link(message, bot, file_hash, "file")
     except Exception as exc:
         logger.warning("Предупреждение: не удалось сохранить файл (%s).", exc)
@@ -2030,7 +2097,7 @@ async def admin_file(message: Message, bot: Bot, state: FSMContext) -> None:
         "Файл сохранён: type=%s hash=%s caption=%s",
         file_type,
         file_hash,
-        bool(caption),
+        bool(caption_html or caption_plain),
     )
 
 
@@ -2039,17 +2106,25 @@ async def admin_text(message: Message, bot: Bot, state: FSMContext) -> None:
     current = await state.get_state()
     if current is not None:
         return
-    text = html_from_message_text(message)
-    if not text:
+    text_plain = plain_from_message_text(message)
+    text_html = html_from_message_text(message)
+    if not text_plain and not text_html:
         return
     try:
-        file_hash = await save_content("text", caption=text)
+        file_hash = await save_content(
+            "text",
+            caption=text_plain,
+            caption_html=text_html,
+            source_chat_id=message.chat.id,
+            source_message_id=message.message_id,
+            owner_id=message.from_user.id if message.from_user else None,
+        )
         await reply_with_share_link(message, bot, file_hash, "text")
     except Exception as exc:
         logger.warning("Предупреждение: не удалось сохранить текст (%s).", exc)
         await message.answer("Не удалось создать ссылку. Отправьте текст ещё раз.")
         return
-    logger.info("Текст сохранён: hash=%s len=%s", file_hash, len(text))
+    logger.info("Текст сохранён: hash=%s len=%s", file_hash, len(text_plain or text_html or ""))
 
 
 @admin_router.callback_query(F.data == "admin:add")
@@ -2176,6 +2251,7 @@ async def _subadmin_begin_upload(
     file_type: str,
     file_id: str | None,
     caption: str | None,
+    caption_html: str | None,
 ) -> None:
     row = await get_sub_admin(message.from_user.id)
     if row is None:
@@ -2193,6 +2269,9 @@ async def _subadmin_begin_upload(
         pending_file_type=file_type,
         pending_file_id=file_id,
         pending_caption=caption,
+        pending_caption_html=caption_html,
+        pending_source_chat_id=message.chat.id,
+        pending_source_message_id=message.message_id,
     )
     await message.answer(
         "Введите список каналов для доступа к ЭТОМУ файлу.\n"
@@ -2214,14 +2293,14 @@ async def sub_admin_file(message: Message, state: FSMContext) -> None:
     if extracted is None:
         return
     file_id, file_type = extracted
-    caption = html_from_message_caption(message)
     await touch_user(message.from_user)
     await _subadmin_begin_upload(
         message,
         state,
         file_type=file_type,
         file_id=file_id,
-        caption=caption,
+        caption=plain_from_message_caption(message),
+        caption_html=html_from_message_caption(message),
     )
 
 
@@ -2254,6 +2333,9 @@ async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: B
         file_type = str(data.get("pending_file_type") or "")
         file_id = data.get("pending_file_id")
         caption = data.get("pending_caption")
+        caption_html = data.get("pending_caption_html")
+        source_chat_id = data.get("pending_source_chat_id")
+        source_message_id = data.get("pending_source_message_id")
         if not file_type:
             await state.clear()
             await message.answer("Сессия сброшена. Пришлите файл заново.")
@@ -2276,6 +2358,9 @@ async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: B
                 file_type,
                 file_id=str(file_id) if file_id else None,
                 caption=str(caption) if caption else None,
+                caption_html=str(caption_html) if caption_html else None,
+                source_chat_id=int(source_chat_id) if source_chat_id else None,
+                source_message_id=int(source_message_id) if source_message_id else None,
                 owner_id=message.from_user.id,
                 use_global_channels=False,
                 extra_channels=channels,
@@ -2302,15 +2387,13 @@ async def sub_admin_text_or_channels(message: Message, state: FSMContext, bot: B
 
     if current is not None:
         return
-    html_text = html_from_message_text(message)
-    if not html_text:
-        return
     await _subadmin_begin_upload(
         message,
         state,
         file_type="text",
         file_id=None,
-        caption=html_text,
+        caption=plain_from_message_text(message),
+        caption_html=html_from_message_text(message),
     )
 
 
