@@ -63,7 +63,7 @@ ADMIN_IDS = frozenset(
     if part.strip().lstrip("-").isdigit()
 )
 # Канал закрыли от накрутки — проверка по ID, кнопка по invite.
-_AMSTER_CHANNEL_ID = "-1004381271887"
+_AMSTER_CHANNEL_ID = "-1001200332719"
 _DEFAULT_MANDATORY = _AMSTER_CHANNEL_ID
 _REMOVED_CHANNELS = frozenset({"@dfgames2", "@amstercloud", "@amstercheats"})
 
@@ -260,7 +260,7 @@ def _parse_button_links(raw: str) -> dict[str, str]:
 
 # Ссылки на кнопках (invite/трекинг). Проверка подписки идёт по @каналу.
 # Invite заказчика для кнопки обязательного канала.
-_CORRECT_AMSTER_INVITE = "https://t.me/+C1cA4N9MfrhmM2Zi"
+_CORRECT_AMSTER_INVITE = "https://t.me/+d3oWQOlocNMzM2Uy"
 _DEFAULT_BUTTON_LINKS = f"{_AMSTER_CHANNEL_ID}={_CORRECT_AMSTER_INVITE}"
 BUTTON_LINKS: dict[str, str] = _parse_button_links(
     os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
@@ -276,6 +276,7 @@ _WRONG_INVITE_CODES = frozenset(
         "9OI-Nlb-CpozNDg6",
         "6P6DJz-GP6dhYmMy",  # techno smart
         "6P6DjZ-GP6dhYmMy",
+        "C1cA4N9MfrhmM2Zi",  # старый неверный канал
     )
 )
 
@@ -302,6 +303,7 @@ def _is_wrong_invite(url: str) -> bool:
 for _k, _v in list(BUTTON_LINKS.items()):
     if _is_wrong_invite(_v):
         BUTTON_LINKS.pop(_k, None)
+BUTTON_LINKS.pop("-1004381271887", None)  # старый неверный ID
 BUTTON_LINKS[_AMSTER_CHANNEL_ID] = _CORRECT_AMSTER_INVITE
 BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
 
