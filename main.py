@@ -18,7 +18,6 @@ Render (Web Service):
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -63,8 +62,10 @@ ADMIN_IDS = frozenset(
     for part in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", _DEFAULT_ADMINS)).split(",")
     if part.strip().lstrip("-").isdigit()
 )
-_DEFAULT_MANDATORY = "@amstercheats"
-_REMOVED_CHANNELS = frozenset({"@dfgames2", "@amstercloud"})
+# Канал закрыли от накрутки — проверка по ID, кнопка по invite.
+_AMSTER_CHANNEL_ID = "-1004381271887"
+_DEFAULT_MANDATORY = _AMSTER_CHANNEL_ID
+_REMOVED_CHANNELS = frozenset({"@dfgames2", "@amstercloud", "@amstercheats"})
 
 
 def _parse_channel_list(raw: str) -> list[str]:
@@ -84,8 +85,8 @@ def _parse_channel_list(raw: str) -> list[str]:
     return result
 
 
-# Только @amstercheats. @amstercloud вырезан намеренно (даже если висит в env).
-MANDATORY_CHANNELS = ["@amstercheats"]
+# Обязательный канал: ID (не @), т.к. канал могут закрыть/сделать приватным.
+MANDATORY_CHANNELS = [_AMSTER_CHANNEL_ID]
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path(__file__).resolve().parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -258,9 +259,9 @@ def _parse_button_links(raw: str) -> dict[str, str]:
 
 
 # Ссылки на кнопках (invite/трекинг). Проверка подписки идёт по @каналу.
-# Актуальный трекинг @amstercheats от заказчика (23:06).
+# Invite заказчика для кнопки обязательного канала.
 _CORRECT_AMSTER_INVITE = "https://t.me/+C1cA4N9MfrhmM2Zi"
-_DEFAULT_BUTTON_LINKS = f"@amstercheats={_CORRECT_AMSTER_INVITE}"
+_DEFAULT_BUTTON_LINKS = f"{_AMSTER_CHANNEL_ID}={_CORRECT_AMSTER_INVITE}"
 BUTTON_LINKS: dict[str, str] = _parse_button_links(
     os.getenv("CHANNEL_BUTTON_LINKS", _DEFAULT_BUTTON_LINKS)
 )
@@ -297,10 +298,11 @@ def _is_wrong_invite(url: str) -> bool:
     return False
 
 
-# Жёстко: кнопка @amstercheats только ссылка заказчика, не techno smart.
+# Жёстко: кнопка обязательного канала = invite заказчика.
 for _k, _v in list(BUTTON_LINKS.items()):
     if _is_wrong_invite(_v):
         BUTTON_LINKS.pop(_k, None)
+BUTTON_LINKS[_AMSTER_CHANNEL_ID] = _CORRECT_AMSTER_INVITE
 BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
 
 
@@ -537,7 +539,7 @@ async def init_db() -> None:
 
 
 async def repair_channel_invites(db=None) -> str:
-    """Удаляет чужие invite и ставит https://t.me/+C1cA4N9MfrhmM2Zi на @amstercheats."""
+    """Удаляет чужие invite и ставит invite заказчика на обязательный канал (по ID)."""
     own_conn = db is None
     if own_conn:
         db = await db_conn()
@@ -562,26 +564,33 @@ async def repair_channel_invites(db=None) -> str:
                     (row["id"],),
                 )
                 removed += 1
-        amster_key = _invite_meta_key("@amstercheats")
-        await db.execute(
-            "INSERT INTO meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (amster_key, _CORRECT_AMSTER_INVITE),
-        )
+        for channel_key in (_AMSTER_CHANNEL_ID, "@amstercheats"):
+            amster_key = _invite_meta_key(channel_key)
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (amster_key, _CORRECT_AMSTER_INVITE),
+            )
+            BUTTON_LINKS[channel_key.lower() if channel_key.startswith("@") else channel_key] = (
+                _CORRECT_AMSTER_INVITE
+            )
+        BUTTON_LINKS[_AMSTER_CHANNEL_ID] = _CORRECT_AMSTER_INVITE
         BUTTON_LINKS["@amstercheats"] = _CORRECT_AMSTER_INVITE
-        # Убрать устаревшие ключи из in-memory, если они битые.
         for key, url in list(BUTTON_LINKS.items()):
             if _is_wrong_invite(url):
                 BUTTON_LINKS.pop(key, None)
+        BUTTON_LINKS[_AMSTER_CHANNEL_ID] = _CORRECT_AMSTER_INVITE
         await db.commit()
         logger.info(
-            "repair invites: removed=%s amstercheats=%s",
+            "repair invites: removed=%s channel=%s invite=%s",
             removed,
+            _AMSTER_CHANNEL_ID,
             _CORRECT_AMSTER_INVITE,
         )
         return (
             f"Готово. Удалено битых ссылок: {removed}.\n"
-            f"@amstercheats → {_CORRECT_AMSTER_INVITE}"
+            f"Обязательный канал: {_AMSTER_CHANNEL_ID}\n"
+            f"Кнопка: {_CORRECT_AMSTER_INVITE}"
         )
     finally:
         if own_conn:
@@ -589,8 +598,8 @@ async def repair_channel_invites(db=None) -> str:
 
 
 async def get_invite_url(channel: str) -> str | None:
-    key = channel.lower()
-    if key == "@amstercheats":
+    key = (channel or "").strip().lower()
+    if key in {_AMSTER_CHANNEL_ID.lower(), "@amstercheats"}:
         return _CORRECT_AMSTER_INVITE
 
     if key in BUTTON_LINKS:
